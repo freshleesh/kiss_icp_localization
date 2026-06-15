@@ -1,0 +1,56 @@
+/**:
+  ros__parameters:
+    # ---- map ----
+    map_pcd_path: ""            # launch가 <maps_root>/<map>/cloudGlobal.pcd 로 채움
+    map_voxel_size: 0.5         # 맵 복셀 해시 셀 크기 (m) — 대응점 탐색 반경도 이에 비례
+    map_max_points_per_voxel: 30
+    use_normals: true           # point-to-plane 정합. PCD normal이 0이면 (fast_livo save_map이 그럼)
+                                # 로드 시 복셀 PCA로 추정 (~0.1s). 비평면 복셀은 p2p 폴백
+
+    # ---- scan preprocessing ----
+    scan_voxel_size: 0.35       # 정합용 스캔 다운샘플 (m). 0.3+map 50pts/voxel이면 잔차 ~6% 개선되나 ICP 시간 1.6배 (bag 튜닝 결과)
+    min_range: 0.3              # 차체 반사 등 근접 노이즈 제거 (m)
+    max_range: 60.0
+    point_filter_num: 1         # N점 중 1점 사용 (1=전부)
+
+    # ---- input ----
+    lidar_topic: "/livox/lidar"
+    imu_topic: "/livox/imu"
+    use_custom_msg: true        # true=livox CustomMsg, false=PointCloud2
+    stamp_at_scan_end: true     # livox 드라이버 use_system_timestamp=true면 header가 100ms 누적 '끝' 시각 (publish 시 now())
+                                # 드라이버를 디바이스 타임으로 쓰면(header=첫 점) false로
+
+    # ---- IMU ----
+    imu_en: true
+    deskew_en: true             # gyro 적분으로 스캔 내 회전 왜곡 보정
+    imu_rate_odom: true         # 라이다 프레임 사이 IMU 전파 odometry 발행
+    imu_init_samples: 100       # 정지 상태 자이로 바이어스 초기화 샘플 수 (200Hz → 0.5s)
+    # LiDAR→IMU 회전 외참 (row-major). MID360 내장 IMU는 identity
+    extrinsic_R_il: [1.0, 0.0, 0.0,
+                     0.0, 1.0, 0.0,
+                     0.0, 0.0, 1.0]
+
+    # ---- ICP / adaptive threshold (KISS-ICP) ----
+    max_iterations: 50
+    convergence_eps: 2.0e-3     # 조기종료 스텝 크기. 1e-5는 NN 재할당 진동 때문에 항상 50회를 다 돌았음
+                                # (2e-3 → 수렴률 5.6%→72%, ICP 33→19ms, 잔차 동일)
+    initial_threshold: 1.0      # 첫 프레임/리셋 직후 대응점 탐색 반경 (m)
+    min_threshold: 0.1          # 적응 임계 하한 (m)
+    min_motion: 0.05            # 이보다 작은 모델 오차는 통계에 미반영 (m)
+    adaptive_range: 60.0        # 적응 임계 회전항의 특성 거리. 15로 줄이면 임계가 조여져
+                                # 공격 주행 구간 lock 100%→83% 붕괴 — 느슨함이 견고성 마진 (bag 실측)
+    vel_smoothing: 0.3          # 속도 추정 EMA (0=차분 그대로). 예측 오차 dev_t p50 0.085→0.071
+    # ---- divergence gate (localization 전용) ----
+    reject_trans: 2.0           # 예측 대비 정합 결과 점프 한도 (m) — 초과 시 프레임 기각, 예측으로 coast
+    reject_rot_deg: 30.0        # 〃 회전 한도 (deg)
+    reject_recover_count: 3     # 연속 기각 N회면 예측이 틀린 것 — 정합 결과로 재앵커
+    max_velocity: 15.0          # 속도 추정 상한 (m/s) — 폭주 피드백 차단
+    max_accel: 10.0             # 속도 추정 변화율 상한 (m/s²) — 복도 퇴화 구간 종방향 속도 폭주 방지
+
+    # ---- initial pose & output ----
+    initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # [x y z roll pitch yaw] (m, rad)
+    use_initial_pose_topic: true                    # /initialpose (RViz 2D Pose Estimate)
+    map_frame: "map"
+    base_frame: "base_link"
+    publish_tf: true
+    publish_aligned_scan: true

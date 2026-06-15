@@ -1,0 +1,690 @@
+// KISS-ICP style map-based localization for Livox MID360 (LiDAR + IMU).
+//
+// - Prior map (PCD) -> static voxel hash map
+// - Incoming scans: IMU-gyro deskew -> voxel downsample -> robust
+//   point-to-point ICP against the map (adaptive correspondence threshold)
+// - Between LiDAR frames the latest pose is propagated with gyro rotation +
+//   constant body velocity and published at IMU rate.
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <deque>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <Eigen/Geometry>
+
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+
+#include "kiss_icp_localization/adaptive_threshold.hpp"
+#include "kiss_icp_localization/registration.hpp"
+#include "kiss_icp_localization/se3.hpp"
+#include "kiss_icp_localization/voxel_hash_map.hpp"
+
+namespace kiss_loc {
+
+struct ImuSample {
+  double t;            // absolute time (s)
+  Eigen::Vector3d w;   // bias-removed angular velocity, LiDAR frame (rad/s)
+};
+
+struct PendingScan {
+  double t_begin = 0.0;  // header stamp (s)
+  double t_end = 0.0;    // stamp of last point (s)
+  double arrival_wall = 0.0;
+  std::vector<Eigen::Vector3d> points;  // sensor frame
+  std::vector<float> rel_time;          // per-point time since t_begin (s); empty if unknown
+};
+
+class LocalizationNode : public rclcpp::Node {
+public:
+  LocalizationNode() : Node("kiss_icp_localization") {
+    declareParams();
+    loadMap();
+    initPoseFromParam();
+
+    adaptive_ = std::make_unique<AdaptiveThreshold>(
+        initial_threshold_, min_threshold_, min_motion_, adaptive_range_);
+
+    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/kiss_loc/odometry", 50);
+    aligned_pub_ =
+        create_publisher<sensor_msgs::msg::PointCloud2>("/kiss_loc/scan_aligned", 5);
+    map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/kiss_loc/map", rclcpp::QoS(1).transient_local());
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    publishMapCloud();
+
+    const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
+    if (use_custom_msg_) {
+      livox_sub_ = create_subscription<livox_ros_driver2::msg::CustomMsg>(
+          lidar_topic_, sensor_qos,
+          [this](const livox_ros_driver2::msg::CustomMsg::SharedPtr msg) {
+            onLivox(msg);
+          });
+    } else {
+      pc2_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+          lidar_topic_, sensor_qos,
+          [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { onPC2(msg); });
+    }
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+        imu_topic_, sensor_qos,
+        [this](const sensor_msgs::msg::Imu::SharedPtr msg) { onImu(msg); });
+    if (use_initial_pose_topic_) {
+      initpose_sub_ =
+          create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+              "/initialpose", 5,
+              [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr
+                         msg) { onInitialPose(msg); });
+    }
+
+    RCLCPP_INFO(get_logger(),
+                "kiss_icp_localization ready: map %zu pts (voxel %.2f m), "
+                "lidar '%s' (%s), imu '%s' (imu_en=%d)",
+                map_.NumPoints(), map_voxel_size_, lidar_topic_.c_str(),
+                use_custom_msg_ ? "CustomMsg" : "PointCloud2", imu_topic_.c_str(),
+                imu_en_);
+  }
+
+private:
+  // ----------------------------- setup -----------------------------
+  void declareParams() {
+    map_pcd_path_ = declare_parameter<std::string>("map_pcd_path", "");
+    map_voxel_size_ = declare_parameter<double>("map_voxel_size", 0.5);
+    map_max_points_ = declare_parameter<int>("map_max_points_per_voxel", 30);
+    // point-to-plane when the map PCD carries normals (fast_livo save_map does)
+    use_normals_ = declare_parameter<bool>("use_normals", true);
+    scan_voxel_size_ = declare_parameter<double>("scan_voxel_size", 0.35);
+    min_range_ = declare_parameter<double>("min_range", 0.3);
+    max_range_ = declare_parameter<double>("max_range", 60.0);
+    point_filter_num_ = declare_parameter<int>("point_filter_num", 1);
+
+    lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/livox/lidar");
+    imu_topic_ = declare_parameter<std::string>("imu_topic", "/livox/imu");
+    use_custom_msg_ = declare_parameter<bool>("use_custom_msg", true);
+    // livox driver with use_system_timestamp stamps the header with now() at
+    // publish time, i.e. at the END of the 100 ms accumulation window
+    stamp_at_scan_end_ = declare_parameter<bool>("stamp_at_scan_end", true);
+
+    imu_en_ = declare_parameter<bool>("imu_en", true);
+    deskew_en_ = declare_parameter<bool>("deskew_en", true);
+    imu_rate_odom_ = declare_parameter<bool>("imu_rate_odom", true);
+    imu_init_samples_ = declare_parameter<int>("imu_init_samples", 100);
+    auto r_il = declare_parameter<std::vector<double>>(
+        "extrinsic_R_il", {1, 0, 0, 0, 1, 0, 0, 0, 1});
+    if (r_il.size() == 9) {
+      R_il_ = Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(r_il.data());
+    } else {
+      R_il_.setIdentity();
+    }
+
+    max_iterations_ = declare_parameter<int>("max_iterations", 50);
+    convergence_eps_ = declare_parameter<double>("convergence_eps", 2e-3);
+    initial_threshold_ = declare_parameter<double>("initial_threshold", 1.0);
+    min_threshold_ = declare_parameter<double>("min_threshold", 0.1);
+    min_motion_ = declare_parameter<double>("min_motion", 0.05);
+    // characteristic range for the rotation term of the adaptive threshold.
+    // Tightening this (e.g. to the true indoor scene scale ~15 m) measurably
+    // LOSES map-lock during aggressive driving — the inflated threshold is
+    // robustness margin, keep it at sensor max range like upstream KISS-ICP
+    adaptive_range_ = declare_parameter<double>("adaptive_range", 60.0);
+    vel_smoothing_ = declare_parameter<double>("vel_smoothing", 0.3);
+    reject_trans_ = declare_parameter<double>("reject_trans", 2.0);
+    reject_rot_deg_ = declare_parameter<double>("reject_rot_deg", 30.0);
+    reject_recover_count_ = declare_parameter<int>("reject_recover_count", 3);
+    max_velocity_ = declare_parameter<double>("max_velocity", 15.0);
+    max_accel_ = declare_parameter<double>("max_accel", 10.0);
+
+    initial_pose_ = declare_parameter<std::vector<double>>(
+        "initial_pose", {0, 0, 0, 0, 0, 0});  // x y z roll pitch yaw
+    use_initial_pose_topic_ = declare_parameter<bool>("use_initial_pose_topic", true);
+
+    print_stats_ = declare_parameter<bool>("print_stats", false);
+    map_frame_ = declare_parameter<std::string>("map_frame", "map");
+    base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+    publish_tf_ = declare_parameter<bool>("publish_tf", true);
+    publish_aligned_scan_ = declare_parameter<bool>("publish_aligned_scan", true);
+  }
+
+  void loadMap() {
+    if (map_pcd_path_.empty()) {
+      RCLCPP_FATAL(get_logger(), "map_pcd_path parameter is empty");
+      throw std::runtime_error("map_pcd_path not set");
+    }
+    pcl::PointCloud<pcl::PointNormal> cloud;  // missing normal fields load as 0
+    if (pcl::io::loadPCDFile<pcl::PointNormal>(map_pcd_path_, cloud) < 0) {
+      RCLCPP_FATAL(get_logger(), "failed to load map PCD: %s", map_pcd_path_.c_str());
+      throw std::runtime_error("failed to load map PCD");
+    }
+    std::vector<Eigen::Vector3d> pts, normals;
+    pts.reserve(cloud.size());
+    normals.reserve(cloud.size());
+    size_t n_valid_normals = 0;
+    for (const auto &p : cloud.points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+        continue;
+      pts.emplace_back(p.x, p.y, p.z);
+      normals.emplace_back(p.normal_x, p.normal_y, p.normal_z);
+      if (normals.back().allFinite() && normals.back().norm() > 0.5)
+        ++n_valid_normals;
+    }
+    const bool normals_ok =
+        use_normals_ && n_valid_normals > pts.size() / 2;
+    map_ = VoxelHashMap(map_voxel_size_, map_max_points_);
+    map_.Build(pts, normals_ok ? normals : std::vector<Eigen::Vector3d>{});
+    if (use_normals_ && !map_.HasNormals()) {
+      // fast_livo save_map writes zero normals — estimate per-voxel by PCA
+      const auto t0 = std::chrono::steady_clock::now();
+      map_.EstimateNormals();
+      RCLCPP_INFO(get_logger(), "estimated map normals by voxel PCA (%.1f s)",
+                  std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count());
+    }
+    map_cloud_raw_ = std::move(pts);
+    RCLCPP_INFO(get_logger(),
+                "loaded map %s: %zu raw pts -> %zu in voxel map (%s)",
+                map_pcd_path_.c_str(), map_cloud_raw_.size(), map_.NumPoints(),
+                map_.HasNormals() ? "point-to-plane" : "point-to-point");
+  }
+
+  void initPoseFromParam() {
+    T_ = Eigen::Isometry3d::Identity();
+    if (initial_pose_.size() == 6) {
+      T_.translation() =
+          Eigen::Vector3d(initial_pose_[0], initial_pose_[1], initial_pose_[2]);
+      T_.linear() =
+          (Eigen::AngleAxisd(initial_pose_[5], Eigen::Vector3d::UnitZ()) *
+           Eigen::AngleAxisd(initial_pose_[4], Eigen::Vector3d::UnitY()) *
+           Eigen::AngleAxisd(initial_pose_[3], Eigen::Vector3d::UnitX()))
+              .toRotationMatrix();
+    }
+    T_prop_ = T_;
+  }
+
+  void publishMapCloud() {
+    // Downsample for visualization only
+    auto ds = VoxelDownsample(map_cloud_raw_, 0.2);
+    pcl::PointCloud<pcl::PointXYZ> cloud;
+    cloud.reserve(ds.size());
+    for (const auto &p : ds) cloud.emplace_back(p.x(), p.y(), p.z());
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(cloud, msg);
+    msg.header.frame_id = map_frame_;
+    msg.header.stamp = now();
+    map_pub_->publish(msg);
+  }
+
+  // --------------------------- callbacks ---------------------------
+  void onLivox(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg) {
+    PendingScan scan;
+    scan.t_begin = rclcpp::Time(msg->header.stamp).seconds();
+    scan.points.reserve(msg->point_num / std::max(1, point_filter_num_) + 1);
+    scan.rel_time.reserve(scan.points.capacity());
+    float max_rel = 0.0f;
+    for (size_t i = 0; i < msg->points.size(); ++i) {
+      if (point_filter_num_ > 1 && static_cast<int>(i % point_filter_num_) != 0)
+        continue;
+      const auto &p = msg->points[i];
+      if (!keepPoint(p.x, p.y, p.z)) continue;
+      scan.points.emplace_back(p.x, p.y, p.z);
+      const float rt = static_cast<float>(p.offset_time) * 1e-9f;
+      scan.rel_time.push_back(rt);
+      max_rel = std::max(max_rel, rt);
+    }
+    finalizeScanTimes(scan, max_rel);
+    enqueueScan(std::move(scan));
+  }
+
+  // scan.t_begin holds the header stamp on entry; place the scan window
+  // around it according to where the driver anchors the stamp
+  void finalizeScanTimes(PendingScan &scan, float max_rel) const {
+    const double header_t = scan.t_begin;
+    if (stamp_at_scan_end_ && max_rel > 0.0f) {
+      scan.t_begin = header_t - max_rel;
+      scan.t_end = header_t;
+    } else {
+      scan.t_end = header_t + max_rel;
+    }
+  }
+
+  void onPC2(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    PendingScan scan;
+    scan.t_begin = rclcpp::Time(msg->header.stamp).seconds();
+
+    // optional per-point time field
+    enum class TimeField { kNone, kOffsetU32Ns, kTimeF32, kTimestampF64 };
+    TimeField tfield = TimeField::kNone;
+    for (const auto &f : msg->fields) {
+      if (f.name == "offset_time" &&
+          f.datatype == sensor_msgs::msg::PointField::UINT32)
+        tfield = TimeField::kOffsetU32Ns;
+      else if (f.name == "time" && f.datatype == sensor_msgs::msg::PointField::FLOAT32)
+        tfield = TimeField::kTimeF32;
+      else if (f.name == "timestamp" &&
+               f.datatype == sensor_msgs::msg::PointField::FLOAT64)
+        tfield = TimeField::kTimestampF64;
+    }
+
+    sensor_msgs::PointCloud2ConstIterator<float> ix(*msg, "x"), iy(*msg, "y"),
+        iz(*msg, "z");
+    std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<uint32_t>> it_off;
+    std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<float>> it_time;
+    std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<double>> it_ts;
+    if (tfield == TimeField::kOffsetU32Ns)
+      it_off = std::make_unique<sensor_msgs::PointCloud2ConstIterator<uint32_t>>(
+          *msg, "offset_time");
+    else if (tfield == TimeField::kTimeF32)
+      it_time =
+          std::make_unique<sensor_msgs::PointCloud2ConstIterator<float>>(*msg, "time");
+    else if (tfield == TimeField::kTimestampF64)
+      it_ts = std::make_unique<sensor_msgs::PointCloud2ConstIterator<double>>(
+          *msg, "timestamp");
+
+    float max_rel = 0.0f;
+    size_t i = 0;
+    double ts0 = std::numeric_limits<double>::quiet_NaN();
+    for (; ix != ix.end(); ++ix, ++iy, ++iz, ++i) {
+      float rt = 0.0f;
+      if (it_off) {
+        rt = static_cast<float>(**it_off) * 1e-9f;
+        ++(*it_off);
+      } else if (it_time) {
+        rt = **it_time;
+        ++(*it_time);
+      } else if (it_ts) {
+        // livox driver: absolute device time (ns) — may differ from the
+        // header stamp (system time), so take it relative to the first point
+        double v = **it_ts;
+        ++(*it_ts);
+        if (v > 1e12) v *= 1e-9;  // ns -> s
+        if (std::isnan(ts0)) ts0 = v;
+        rt = static_cast<float>(v - ts0);
+      }
+      if (point_filter_num_ > 1 && static_cast<int>(i % point_filter_num_) != 0)
+        continue;
+      if (!keepPoint(*ix, *iy, *iz)) continue;
+      scan.points.emplace_back(*ix, *iy, *iz);
+      if (tfield != TimeField::kNone) {
+        scan.rel_time.push_back(rt);
+        max_rel = std::max(max_rel, rt);
+      }
+    }
+    finalizeScanTimes(scan, max_rel);
+    enqueueScan(std::move(scan));
+  }
+
+  bool keepPoint(float x, float y, float z) const {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+    const double r2 = double(x) * x + double(y) * y + double(z) * z;
+    return r2 > min_range_ * min_range_ && r2 < max_range_ * max_range_;
+  }
+
+  void onImu(const sensor_msgs::msg::Imu::SharedPtr msg) {
+    const double t = rclcpp::Time(msg->header.stamp).seconds();
+    const Eigen::Vector3d w_raw(msg->angular_velocity.x, msg->angular_velocity.y,
+                                msg->angular_velocity.z);
+
+    if (!bias_ready_) {
+      bias_acc_.push_back(w_raw);
+      if (static_cast<int>(bias_acc_.size()) >= imu_init_samples_) {
+        gyro_bias_.setZero();
+        for (const auto &w : bias_acc_) gyro_bias_ += w;
+        gyro_bias_ /= bias_acc_.size();
+        bias_acc_.clear();
+        bias_ready_ = true;
+        RCLCPP_INFO(get_logger(), "gyro bias initialized: [%.5f %.5f %.5f] rad/s",
+                    gyro_bias_.x(), gyro_bias_.y(), gyro_bias_.z());
+      }
+      return;
+    }
+
+    // angular velocity in LiDAR frame
+    const Eigen::Vector3d w = R_il_.transpose() * (w_raw - gyro_bias_);
+    if (!imu_buf_.empty() && t <= imu_buf_.back().t) return;  // out-of-order
+    imu_buf_.push_back({t, w});
+    while (!imu_buf_.empty() && imu_buf_.front().t < t - 10.0) imu_buf_.pop_front();
+
+    // high-rate propagated odometry between LiDAR frames
+    if (imu_rate_odom_ && have_first_fix_) {
+      const double dt = t - t_prop_;
+      if (t_prop_ > 0.0 && dt > 0.0 && dt < 0.1) {
+        T_prop_.linear() = T_prop_.rotation() * So3Exp(w * dt);
+        T_prop_.translation() += T_prop_.rotation() * (v_body_ * dt);
+        publishOdom(T_prop_, t);
+      }
+      t_prop_ = t;
+    }
+
+    processPending();
+  }
+
+  void onInitialPose(
+      const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    const auto &p = msg->pose.pose.position;
+    const auto &q = msg->pose.pose.orientation;
+    T.translation() = Eigen::Vector3d(p.x, p.y, p.z);
+    T.linear() = Eigen::Quaterniond(q.w, q.x, q.y, q.z).toRotationMatrix();
+    // RViz 2D Pose Estimate has z = 0; keep current z to stay on the map floor
+    if (have_first_fix_) T.translation().z() = T_.translation().z();
+    T_ = T;
+    T_prop_ = T;
+    v_body_.setZero();
+    adaptive_->Reset();
+    RCLCPP_WARN(get_logger(), "re-anchored from /initialpose: [%.2f %.2f %.2f]",
+                T.translation().x(), T.translation().y(), T.translation().z());
+  }
+
+  // ------------------------- scan processing -------------------------
+  void enqueueScan(PendingScan &&scan) {
+    if (scan.points.empty()) return;
+    scan.arrival_wall = nowSec();
+    pending_.push_back(std::move(scan));
+    while (pending_.size() > 20) {
+      pending_.pop_front();
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "scan queue overflow, dropping oldest");
+    }
+    processPending();
+  }
+
+  double nowSec() { return get_clock()->now().seconds(); }
+
+  void processPending() {
+    if (imu_en_ && !bias_ready_) {
+      // gyro bias still initializing — scans from this period are useless
+      // (no deskew, no prediction) and the platform should be static anyway
+      if (pending_.size() > 1) pending_.erase(pending_.begin(), pending_.end() - 1);
+      return;
+    }
+    while (!pending_.empty()) {
+      const auto &front = pending_.front();
+      bool imu_ok = !imu_en_ || (bias_ready_ && !imu_buf_.empty() &&
+                                 imu_buf_.back().t >= front.t_end);
+      if (!imu_ok) {
+        // wait for IMU coverage, but never stall on a dead IMU stream
+        if (nowSec() - front.arrival_wall < 0.3) return;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                             "processing scan without full IMU coverage");
+      }
+      PendingScan scan = std::move(pending_.front());
+      pending_.pop_front();
+      processScan(scan);
+    }
+  }
+
+  // Integrate gyro over [ta, tb]; returns rotation of frame(tb) w.r.t. frame(ta).
+  Eigen::Matrix3d integrateGyro(double ta, double tb) const {
+    Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
+    if (imu_buf_.empty() || tb <= ta) return R;
+    double t_cur = ta;
+    for (size_t i = 0; i < imu_buf_.size(); ++i) {
+      const auto &s = imu_buf_[i];
+      if (s.t <= t_cur) continue;
+      const double t_next = std::min(s.t, tb);
+      R = R * So3Exp(s.w * (t_next - t_cur));
+      t_cur = t_next;
+      if (t_cur >= tb) break;
+    }
+    if (t_cur < tb && !imu_buf_.empty())
+      R = R * So3Exp(imu_buf_.back().w * (tb - t_cur));
+    return R;
+  }
+
+  void processScan(const PendingScan &scan) {
+    const auto t_start = std::chrono::steady_clock::now();
+    auto ms_since = [](const std::chrono::steady_clock::time_point &t0) {
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t0)
+          .count();
+    };
+
+    // 1) deskew to scan end using gyro rotation + constant body velocity
+    std::vector<Eigen::Vector3d> pts;
+    const bool do_deskew = imu_en_ && deskew_en_ && bias_ready_ &&
+                           !scan.rel_time.empty() && scan.t_end > scan.t_begin;
+    if (do_deskew) {
+      // Rotation timeline relative to scan begin, sampled at IMU timestamps.
+      // ws[k] is the angular velocity active on segment (ts[k-1], ts[k]].
+      std::vector<double> ts{scan.t_begin};
+      std::vector<Eigen::Matrix3d> Rs{Eigen::Matrix3d::Identity()};
+      std::vector<Eigen::Vector3d> ws{Eigen::Vector3d::Zero()};
+      for (const auto &s : imu_buf_) {
+        if (s.t <= scan.t_begin || s.t > scan.t_end + 0.01) continue;
+        Rs.push_back(Rs.back() * So3Exp(s.w * (s.t - ts.back())));
+        ts.push_back(s.t);
+        ws.push_back(s.w);
+      }
+      const Eigen::Vector3d w_last = imu_buf_.empty()
+                                         ? Eigen::Vector3d::Zero()
+                                         : imu_buf_.back().w;
+      auto rotAt = [&](double t) -> Eigen::Matrix3d {
+        auto it = std::upper_bound(ts.begin(), ts.end(), t);
+        const size_t idx = (it == ts.begin()) ? 0 : (it - ts.begin() - 1);
+        const Eigen::Vector3d w = (idx + 1 < ts.size()) ? ws[idx + 1] : w_last;
+        return Rs[idx] * So3Exp(w * std::max(0.0, t - ts[idx]));
+      };
+      const Eigen::Matrix3d R_end = rotAt(scan.t_end);
+      pts.reserve(scan.points.size());
+      for (size_t i = 0; i < scan.points.size(); ++i) {
+        const double ti = scan.t_begin + scan.rel_time[i];
+        const Eigen::Matrix3d R_rel = R_end.transpose() * rotAt(ti);
+        pts.push_back(R_rel * scan.points[i] + v_body_ * (ti - scan.t_end));
+      }
+    } else {
+      pts = scan.points;
+    }
+
+    // 2) downsample
+    const auto ds = VoxelDownsample(pts, scan_voxel_size_);
+    if (ds.size() < 20) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "too few points after downsampling (%zu), skipping",
+                           ds.size());
+      return;
+    }
+
+    // 3) motion prediction
+    Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
+    const double dt = (last_scan_end_ > 0.0) ? scan.t_end - last_scan_end_ : 0.0;
+    if (dt > 0.0 && dt < 0.5) {
+      if (imu_en_ && bias_ready_)
+        delta.linear() = integrateGyro(last_scan_end_, scan.t_end);
+      delta.translation() = v_body_ * dt;
+    }
+    const Eigen::Isometry3d T_pred = T_ * delta;
+
+    // 4) registration
+    const double prep_ms = ms_since(t_start);
+    const auto t_icp = std::chrono::steady_clock::now();
+    const double th = adaptive_->ComputeThreshold();
+    const auto result = AlignScanToMap(ds, map_, T_pred, th, th / 3.0,
+                                       max_iterations_, convergence_eps_,
+                                       use_normals_);
+    const double icp_ms = ms_since(t_icp);
+
+    // 5) divergence gate — an isolated fix jumping away from the prediction
+    // is treated as an ICP glitch and coasted over; if it persists, the
+    // prediction is what's wrong, so re-anchor to the registration result
+    const Eigen::Isometry3d dev = T_pred.inverse() * result.pose;
+    const double dev_t = dev.translation().norm();
+    const double dev_r = RotationAngle(dev.rotation());
+    bool reanchored = false;
+    if (dev_t > reject_trans_ || dev_r > reject_rot_deg_ * M_PI / 180.0) {
+      ++consecutive_rejects_;
+      if (consecutive_rejects_ < reject_recover_count_) {
+        RCLCPP_WARN(get_logger(),
+                    "registration rejected (dev %.2f m / %.1f deg, corr %d) — "
+                    "coasting on prediction (%d consecutive)",
+                    dev_t, dev_r * 180.0 / M_PI, result.num_correspondences,
+                    consecutive_rejects_);
+        T_ = T_pred;
+        last_scan_end_ = scan.t_end;
+        T_prop_ = T_;
+        t_prop_ = scan.t_end;
+        publishOdom(T_, scan.t_end);
+        return;
+      }
+      RCLCPP_WARN(get_logger(),
+                  "re-anchoring to registration result after %d rejects "
+                  "(dev %.2f m / %.1f deg)",
+                  consecutive_rejects_, dev_t, dev_r * 180.0 / M_PI);
+      adaptive_->Reset();
+      v_body_.setZero();
+      reanchored = true;
+    }
+    consecutive_rejects_ = 0;
+    if (!reanchored) adaptive_->UpdateModelDeviation(dev);
+
+    // 6) state update — velocity from consecutive fixes, with physical
+    // accel/speed limits: in corridor-degenerate stretches ICP can't observe
+    // the along-track direction, and an unbounded velocity estimate feeds
+    // back into the prediction and runs away
+    if (!reanchored && dt > 0.0 && dt < 0.5) {
+      const Eigen::Vector3d v_new = result.pose.rotation().transpose() *
+                                    (result.pose.translation() - T_.translation()) / dt;
+      Eigen::Vector3d dv = (1.0 - vel_smoothing_) * (v_new - v_body_);
+      const double dv_max = max_accel_ * dt;
+      if (dv.norm() > dv_max) dv *= dv_max / dv.norm();
+      v_body_ += dv;
+      if (v_body_.norm() > max_velocity_)
+        v_body_ *= max_velocity_ / v_body_.norm();
+    }
+    T_ = result.pose;
+    last_scan_end_ = scan.t_end;
+    T_prop_ = T_;
+    t_prop_ = scan.t_end;
+    have_first_fix_ = true;
+
+    publishOdom(T_, scan.t_end);
+    if (publish_aligned_scan_) publishAligned(ds, scan.t_end);
+
+    if (print_stats_) {
+      // STAT lines are machine-parseable (key=value) for offline analysis
+      RCLCPP_INFO(get_logger(),
+                  "STAT t=%.3f raw=%zu ds=%zu prep_ms=%.1f icp_ms=%.1f "
+                  "iters=%d corr=%d conv=%d th=%.3f dev_t=%.3f dev_r=%.2f "
+                  "dt=%.3f v=%.2f q=%zu lat_ms=%.0f",
+                  scan.t_end, scan.points.size(), ds.size(), prep_ms, icp_ms,
+                  result.iterations, result.num_correspondences,
+                  result.converged ? 1 : 0, th, dev_t, dev_r * 180.0 / M_PI,
+                  dt, v_body_.norm(), pending_.size(),
+                  (nowSec() - scan.arrival_wall) * 1e3);
+    }
+  }
+
+  // --------------------------- publishing ---------------------------
+  void publishOdom(const Eigen::Isometry3d &T, double t) {
+    nav_msgs::msg::Odometry odom;
+    odom.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
+    odom.header.frame_id = map_frame_;
+    odom.child_frame_id = base_frame_;
+    const Eigen::Quaterniond q(T.rotation());
+    odom.pose.pose.position.x = T.translation().x();
+    odom.pose.pose.position.y = T.translation().y();
+    odom.pose.pose.position.z = T.translation().z();
+    odom.pose.pose.orientation.w = q.w();
+    odom.pose.pose.orientation.x = q.x();
+    odom.pose.pose.orientation.y = q.y();
+    odom.pose.pose.orientation.z = q.z();
+    odom.twist.twist.linear.x = v_body_.x();
+    odom.twist.twist.linear.y = v_body_.y();
+    odom.twist.twist.linear.z = v_body_.z();
+    odom_pub_->publish(odom);
+
+    if (publish_tf_) {
+      geometry_msgs::msg::TransformStamped tf;
+      tf.header = odom.header;
+      tf.child_frame_id = base_frame_;
+      tf.transform.translation.x = T.translation().x();
+      tf.transform.translation.y = T.translation().y();
+      tf.transform.translation.z = T.translation().z();
+      tf.transform.rotation = odom.pose.pose.orientation;
+      tf_broadcaster_->sendTransform(tf);
+    }
+  }
+
+  void publishAligned(const std::vector<Eigen::Vector3d> &pts, double t) {
+    pcl::PointCloud<pcl::PointXYZ> cloud;
+    cloud.reserve(pts.size());
+    for (const auto &p : pts) {
+      const Eigen::Vector3d pw = T_ * p;
+      cloud.emplace_back(pw.x(), pw.y(), pw.z());
+    }
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(cloud, msg);
+    msg.header.frame_id = map_frame_;
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
+    aligned_pub_->publish(msg);
+  }
+
+  // --------------------------- members ---------------------------
+  // params
+  std::string map_pcd_path_, lidar_topic_, imu_topic_, map_frame_, base_frame_;
+  double map_voxel_size_, scan_voxel_size_, min_range_, max_range_;
+  int map_max_points_, point_filter_num_, max_iterations_, imu_init_samples_;
+  double convergence_eps_, initial_threshold_, min_threshold_, min_motion_;
+  double reject_trans_, reject_rot_deg_, max_velocity_, max_accel_;
+  double adaptive_range_, vel_smoothing_;
+  int reject_recover_count_ = 3;
+  int consecutive_rejects_ = 0;
+  bool use_custom_msg_, stamp_at_scan_end_, imu_en_, deskew_en_, imu_rate_odom_,
+      publish_tf_, publish_aligned_scan_, use_initial_pose_topic_, print_stats_,
+      use_normals_;
+  std::vector<double> initial_pose_;
+  Eigen::Matrix3d R_il_ = Eigen::Matrix3d::Identity();
+
+  // map & estimation state
+  VoxelHashMap map_;
+  std::vector<Eigen::Vector3d> map_cloud_raw_;
+  std::unique_ptr<AdaptiveThreshold> adaptive_;
+  Eigen::Isometry3d T_ = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d T_prop_ = Eigen::Isometry3d::Identity();
+  Eigen::Vector3d v_body_ = Eigen::Vector3d::Zero();
+  double last_scan_end_ = -1.0;
+  double t_prop_ = -1.0;
+  bool have_first_fix_ = false;
+
+  // imu
+  std::deque<ImuSample> imu_buf_;
+  std::vector<Eigen::Vector3d> bias_acc_;
+  Eigen::Vector3d gyro_bias_ = Eigen::Vector3d::Zero();
+  bool bias_ready_ = false;
+
+  std::deque<PendingScan> pending_;
+
+  // ros interfaces
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_pub_, map_pub_;
+  rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr livox_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc2_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+      initpose_sub_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+};
+
+}  // namespace kiss_loc
+
+int main(int argc, char **argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<kiss_loc::LocalizationNode>());
+  rclcpp::shutdown();
+  return 0;
+}
