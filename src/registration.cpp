@@ -4,6 +4,8 @@
 #include <omp.h>
 #endif
 
+#include <algorithm>
+
 #include "kiss_icp_localization/se3.hpp"
 
 namespace kiss_loc {
@@ -59,7 +61,11 @@ RegistrationResult AlignScanToMap(const std::vector<Eigen::Vector3d> &scan,
     int n = 0;
 
 #ifdef _OPENMP
-#pragma omp parallel
+    // Cap threads: each iteration's parallel region only has a few thousand
+    // points, so fork/join + reduction across many cores costs far more than
+    // the work itself (24 threads measured ~15x slower than 8 on this scan
+    // size). 8 saturates the useful parallelism here.
+#pragma omp parallel num_threads(std::min(8, omp_get_max_threads()))
     {
       Eigen::Matrix<double, 6, 6> JTJ_p = Eigen::Matrix<double, 6, 6>::Zero();
       Eigen::Matrix<double, 6, 1> JTr_p = Eigen::Matrix<double, 6, 1>::Zero();

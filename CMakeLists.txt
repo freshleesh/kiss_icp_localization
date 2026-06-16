@@ -15,7 +15,7 @@ find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
-find_package(livox_ros_driver2 REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io)
 find_package(OpenMP COMPONENTS CXX)
@@ -24,6 +24,7 @@ find_package(OpenMP COMPONENTS CXX)
 add_library(kiss_loc_core
   src/voxel_hash_map.cpp
   src/registration.cpp
+  src/bev_detector.cpp
 )
 target_include_directories(kiss_loc_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -38,7 +39,7 @@ add_executable(localization_node src/localization_node.cpp)
 target_link_libraries(localization_node kiss_loc_core ${PCL_LIBRARIES})
 target_include_directories(localization_node PRIVATE ${PCL_INCLUDE_DIRS})
 ament_target_dependencies(localization_node
-  rclcpp sensor_msgs nav_msgs geometry_msgs tf2_ros pcl_conversions livox_ros_driver2
+  rclcpp sensor_msgs nav_msgs geometry_msgs tf2_ros pcl_conversions visualization_msgs
 )
 
 install(TARGETS localization_node kiss_loc_core

@@ -14,9 +14,8 @@
     point_filter_num: 1         # N점 중 1점 사용 (1=전부)
 
     # ---- input ----
-    lidar_topic: "/livox/lidar"
+    lidar_topic: "/livox/lidar"   # sensor_msgs/PointCloud2
     imu_topic: "/livox/imu"
-    use_custom_msg: true        # true=livox CustomMsg, false=PointCloud2
     stamp_at_scan_end: true     # livox 드라이버 use_system_timestamp=true면 header가 100ms 누적 '끝' 시각 (publish 시 now())
                                 # 드라이버를 디바이스 타임으로 쓰면(header=첫 점) false로
 
@@ -54,3 +53,24 @@
     base_frame: "base_link"
     publish_tf: true
     publish_aligned_scan: true
+
+    # ---- BEV object detection (선택) ----
+    # localization 산출물(deskew+정합된 스캔)에 얹는 2D 검출. 맵에 없는 점을
+    # rolling 배경(self-healing)과 비교 → foreground 클러스터링 → 시간 트래킹으로
+    # static/moving(opponent) 구분. lock(수렴) 상태에서만 동작.
+    detect_en: false              # 기본 off. v14 launch는 true로 켬
+    detect_res: 0.2               # BEV 셀 크기 (m)
+    # 지면 평면 z = a*x + b*y + c (map 프레임). 맵별로 다름 — 0이면 z=상수 가정.
+    # v14 값은 launch에서 오버라이드 (analyze_map_z.py로 추출)
+    detect_ground_a: 0.0
+    detect_ground_b: 0.0
+    detect_ground_c: 0.0
+    detect_z_min: 0.2             # 지면 위 이 높이부터 (지면 노이즈 95% ±0.14m 위로)
+    detect_z_max: 1.5             # 이 높이까지 (머리 위 구조물 제외). 차 높이에 맞춰 조정
+    detect_persist_tau: 1.0       # 배경 지속성 시간상수 (s)
+    detect_persist: 3.0           # 디케이 점수 ≥ 이 값이면 static 배경 (~3프레임 ≈ 0.3s)
+    detect_min_cluster_cells: 3   # 이보다 작은 클러스터는 버림
+    detect_track_gate: 1.0        # centroid 연관 최대 이동 (m)
+    detect_moving_speed: 0.5      # |v| 초과 시 moving(opponent)으로 분류 (m/s)
+    detect_warmup_frames: 5       # 배경 안정화 전까지 검출 보류
+    detect_max_misses: 5          # 미매칭 N프레임 후 트랙 제거

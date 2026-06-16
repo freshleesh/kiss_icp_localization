@@ -1,12 +1,16 @@
-"""KISS-ICP map-based localization (MID360 + IMU).
+"""KISS-ICP localization on the local v14 map (convenience launch).
 
-Usage:
-    ros2 launch kiss_icp_localization localization.launch.py map:=hall_0609
+A thin wrapper around the node that hard-points at the local v14 PCD:
+    /home/leesh/ifac/kiss_ws/src/kiss_icp_localization/map/v14/map.pcd
 
-`map:=` is the map directory name under the maps root; the node loads
-<maps_root>/<map>/cloudGlobal.pcd. Override the root with the
-KISS_LOC_MAPS_ROOT env var (falls back to FASTLIVO_MAPS_ROOT, then the
-in-repo stack_master/maps path).
+This does NOT touch the default config/launch — `localization.launch.py`
+still resolves maps via KISS_LOC_MAPS_ROOT exactly as before. This file is
+just a local shortcut so you can run:
+
+    ros2 launch kiss_icp_localization localization_v14.launch.py
+
+(the v14 map.pcd is XYZI without normals; the node estimates normals by
+PCA at load, so point-to-plane still applies.)
 """
 import os
 
@@ -20,18 +24,10 @@ from launch.actions import (
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-DEFAULT_MAPS_ROOT = os.environ.get(
-    "KISS_LOC_MAPS_ROOT",
-    os.environ.get(
-        "FASTLIVO_MAPS_ROOT",
-        "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps",
-    ),
-)
+MAP_PCD = "/home/leesh/ifac/kiss_ws/src/kiss_icp_localization/map/v14/map.pcd"
 
 
 def launch_setup(context, *args, **kwargs):
-    map_name = LaunchConfiguration("map").perform(context)
-    map_pcd = os.path.join(DEFAULT_MAPS_ROOT, map_name, "cloudGlobal.pcd")
     share = get_package_share_directory("kiss_icp_localization")
     config = os.path.join(share, "config", "mid360_localization.yaml")
     nodes = [
@@ -42,7 +38,15 @@ def launch_setup(context, *args, **kwargs):
             output="screen",
             parameters=[
                 config,
-                {"map_pcd_path": map_pcd},
+                {
+                    "map_pcd_path": MAP_PCD,
+                    # BEV detection on, with the v14 ground plane measured by
+                    # analyze_map_z.py (tilt 0.94 deg, floor flat to ~5 cm)
+                    "detect_en": True,
+                    "detect_ground_a": -0.00672,
+                    "detect_ground_b": -0.01499,
+                    "detect_ground_c": -0.895,
+                },
             ],
         )
     ]
@@ -61,12 +65,9 @@ def launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     return LaunchDescription(
         [
-            # ICP's per-iteration parallel region is small; many cores hurt
-            # (fork/join overhead). Cap threads unless the user already set it.
             SetEnvironmentVariable(
                 "OMP_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "8")
             ),
-            DeclareLaunchArgument("map", default_value="hall_0609"),
             DeclareLaunchArgument("use_rviz", default_value="false"),
             OpaqueFunction(function=launch_setup),
         ]

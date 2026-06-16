@@ -24,15 +24,16 @@
 
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <livox_ros_driver2/msg/custom_msg.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "kiss_icp_localization/adaptive_threshold.hpp"
+#include "kiss_icp_localization/bev_detector.hpp"
 #include "kiss_icp_localization/registration.hpp"
 #include "kiss_icp_localization/se3.hpp"
 #include "kiss_icp_localization/voxel_hash_map.hpp"
@@ -70,18 +71,24 @@ public:
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     publishMapCloud();
 
-    const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
-    if (use_custom_msg_) {
-      livox_sub_ = create_subscription<livox_ros_driver2::msg::CustomMsg>(
-          lidar_topic_, sensor_qos,
-          [this](const livox_ros_driver2::msg::CustomMsg::SharedPtr msg) {
-            onLivox(msg);
-          });
-    } else {
-      pc2_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-          lidar_topic_, sensor_qos,
-          [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { onPC2(msg); });
+    if (detect_en_) {
+      detector_ = std::make_unique<BevDetector>(bev_params_);
+      fg_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+          "/kiss_loc/foreground", 5);
+      det_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+          "/kiss_loc/detections", 5);
+      RCLCPP_INFO(get_logger(),
+                  "BEV detection enabled: res %.2f m, z-band [%.2f, %.2f] above "
+                  "ground (%.4f,%.4f,%.3f), persist %.1f",
+                  bev_params_.res, bev_params_.z_min, bev_params_.z_max,
+                  bev_params_.ga, bev_params_.gb, bev_params_.gc,
+                  bev_params_.persist);
     }
+
+    const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
+    pc2_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        lidar_topic_, sensor_qos,
+        [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { onPC2(msg); });
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
         imu_topic_, sensor_qos,
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) { onImu(msg); });
@@ -95,10 +102,9 @@ public:
 
     RCLCPP_INFO(get_logger(),
                 "kiss_icp_localization ready: map %zu pts (voxel %.2f m), "
-                "lidar '%s' (%s), imu '%s' (imu_en=%d)",
+                "lidar '%s' (PointCloud2), imu '%s' (imu_en=%d)",
                 map_.NumPoints(), map_voxel_size_, lidar_topic_.c_str(),
-                use_custom_msg_ ? "CustomMsg" : "PointCloud2", imu_topic_.c_str(),
-                imu_en_);
+                imu_topic_.c_str(), imu_en_);
   }
 
 private:
@@ -116,7 +122,6 @@ private:
 
     lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/livox/lidar");
     imu_topic_ = declare_parameter<std::string>("imu_topic", "/livox/imu");
-    use_custom_msg_ = declare_parameter<bool>("use_custom_msg", true);
     // livox driver with use_system_timestamp stamps the header with now() at
     // publish time, i.e. at the END of the 100 ms accumulation window
     stamp_at_scan_end_ = declare_parameter<bool>("stamp_at_scan_end", true);
@@ -159,6 +164,25 @@ private:
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     publish_tf_ = declare_parameter<bool>("publish_tf", true);
     publish_aligned_scan_ = declare_parameter<bool>("publish_aligned_scan", true);
+
+    // ---- BEV object detection (unmapped statics + opponents) ----
+    detect_en_ = declare_parameter<bool>("detect_en", false);
+    BevParams bp;
+    bp.res = declare_parameter<double>("detect_res", 0.2);
+    // ground plane in map frame: z = ga*x + gb*y + gc (from map z-analysis)
+    bp.ga = declare_parameter<double>("detect_ground_a", 0.0);
+    bp.gb = declare_parameter<double>("detect_ground_b", 0.0);
+    bp.gc = declare_parameter<double>("detect_ground_c", 0.0);
+    bp.z_min = declare_parameter<double>("detect_z_min", 0.2);
+    bp.z_max = declare_parameter<double>("detect_z_max", 1.5);
+    bp.tau = declare_parameter<double>("detect_persist_tau", 1.0);
+    bp.persist = declare_parameter<double>("detect_persist", 3.0);
+    bp.min_cluster_cells = declare_parameter<int>("detect_min_cluster_cells", 3);
+    bp.track_gate = declare_parameter<double>("detect_track_gate", 1.0);
+    bp.moving_speed = declare_parameter<double>("detect_moving_speed", 0.5);
+    bp.warmup_frames = declare_parameter<int>("detect_warmup_frames", 5);
+    bp.max_misses = declare_parameter<int>("detect_max_misses", 5);
+    bev_params_ = bp;
   }
 
   void loadMap() {
@@ -231,26 +255,6 @@ private:
   }
 
   // --------------------------- callbacks ---------------------------
-  void onLivox(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg) {
-    PendingScan scan;
-    scan.t_begin = rclcpp::Time(msg->header.stamp).seconds();
-    scan.points.reserve(msg->point_num / std::max(1, point_filter_num_) + 1);
-    scan.rel_time.reserve(scan.points.capacity());
-    float max_rel = 0.0f;
-    for (size_t i = 0; i < msg->points.size(); ++i) {
-      if (point_filter_num_ > 1 && static_cast<int>(i % point_filter_num_) != 0)
-        continue;
-      const auto &p = msg->points[i];
-      if (!keepPoint(p.x, p.y, p.z)) continue;
-      scan.points.emplace_back(p.x, p.y, p.z);
-      const float rt = static_cast<float>(p.offset_time) * 1e-9f;
-      scan.rel_time.push_back(rt);
-      max_rel = std::max(max_rel, rt);
-    }
-    finalizeScanTimes(scan, max_rel);
-    enqueueScan(std::move(scan));
-  }
-
   // scan.t_begin holds the header stamp on entry; place the scan window
   // around it according to where the driver anchors the stamp
   void finalizeScanTimes(PendingScan &scan, float max_rel) const {
@@ -575,6 +579,15 @@ private:
     publishOdom(T_, scan.t_end);
     if (publish_aligned_scan_) publishAligned(ds, scan.t_end);
 
+    // detection runs only on a confident, locked fix — a mislocalized pose
+    // would paint the whole scan as foreground. The divergence-coast path
+    // already returned above; here we additionally require convergence and
+    // skip the frame we just re-anchored on.
+    if (detect_en_ && detector_ && have_first_fix_ && !reanchored &&
+        result.converged) {
+      runDetection(pts, scan.t_end);
+    }
+
     if (print_stats_) {
       // STAT lines are machine-parseable (key=value) for offline analysis
       RCLCPP_INFO(get_logger(),
@@ -634,6 +647,77 @@ private:
     aligned_pub_->publish(msg);
   }
 
+  // --------------------------- detection ---------------------------
+  // `scan_sensor` is the deskewed scan in the sensor frame; transform to the
+  // map frame with the just-solved pose and feed the BEV detector.
+  void runDetection(const std::vector<Eigen::Vector3d> &scan_sensor, double t) {
+    std::vector<Eigen::Vector3d> pts_map;
+    pts_map.reserve(scan_sensor.size());
+    for (const auto &p : scan_sensor) pts_map.push_back(T_ * p);
+
+    const BevResult res = detector_->Update(pts_map, t);
+    const auto stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
+
+    // foreground cloud
+    if (fg_pub_->get_subscription_count() > 0) {
+      pcl::PointCloud<pcl::PointXYZ> fg;
+      fg.reserve(res.foreground.size());
+      for (const auto &p : res.foreground) fg.emplace_back(p.x(), p.y(), p.z());
+      sensor_msgs::msg::PointCloud2 msg;
+      pcl::toROSMsg(fg, msg);
+      msg.header.frame_id = map_frame_;
+      msg.header.stamp = stamp;
+      fg_pub_->publish(msg);
+    }
+
+    // detection markers (cube + id/speed label per object)
+    visualization_msgs::msg::MarkerArray arr;
+    visualization_msgs::msg::Marker clear;
+    clear.header.frame_id = map_frame_;
+    clear.header.stamp = stamp;
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(clear);
+    for (const auto &d : res.detections) {
+      const double gz = bev_params_.ga * d.centroid.x() +
+                        bev_params_.gb * d.centroid.y() + bev_params_.gc;
+      visualization_msgs::msg::Marker m;
+      m.header.frame_id = map_frame_;
+      m.header.stamp = stamp;
+      m.ns = "objects";
+      m.id = d.id;
+      m.type = visualization_msgs::msg::Marker::CUBE;
+      m.action = visualization_msgs::msg::Marker::ADD;
+      m.pose.position.x = d.centroid.x();
+      m.pose.position.y = d.centroid.y();
+      m.pose.position.z = gz + bev_params_.z_min + 0.5 * std::max(0.1, d.height);
+      m.pose.orientation.w = 1.0;
+      m.scale.x = std::max(0.2, 2.0 * d.extent);
+      m.scale.y = std::max(0.2, 2.0 * d.extent);
+      m.scale.z = std::max(0.1, d.height);
+      m.color.a = 0.6f;
+      // moving (opponent) = red, static/unresolved = orange
+      m.color.r = 1.0f;
+      m.color.g = d.moving ? 0.1f : 0.6f;
+      m.color.b = 0.1f;
+      m.lifetime = rclcpp::Duration::from_seconds(0.3);
+      arr.markers.push_back(m);
+
+      visualization_msgs::msg::Marker txt = m;
+      txt.ns = "labels";
+      txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+      txt.pose.position.z += 0.5 * m.scale.z + 0.3;
+      txt.scale.z = 0.4;
+      txt.color.a = 1.0f;
+      txt.color.r = txt.color.g = txt.color.b = 1.0f;
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "#%d %s %.1fm/s", d.id,
+                    d.moving ? "OPP" : "stat", d.speed);
+      txt.text = buf;
+      arr.markers.push_back(txt);
+    }
+    det_pub_->publish(arr);
+  }
+
   // --------------------------- members ---------------------------
   // params
   std::string map_pcd_path_, lidar_topic_, imu_topic_, map_frame_, base_frame_;
@@ -644,11 +728,13 @@ private:
   double adaptive_range_, vel_smoothing_;
   int reject_recover_count_ = 3;
   int consecutive_rejects_ = 0;
-  bool use_custom_msg_, stamp_at_scan_end_, imu_en_, deskew_en_, imu_rate_odom_,
+  bool stamp_at_scan_end_, imu_en_, deskew_en_, imu_rate_odom_,
       publish_tf_, publish_aligned_scan_, use_initial_pose_topic_, print_stats_,
       use_normals_;
   std::vector<double> initial_pose_;
   Eigen::Matrix3d R_il_ = Eigen::Matrix3d::Identity();
+  bool detect_en_ = false;
+  BevParams bev_params_;
 
   // map & estimation state
   VoxelHashMap map_;
@@ -672,12 +758,16 @@ private:
   // ros interfaces
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_pub_, map_pub_;
-  rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr livox_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc2_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
       initpose_sub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+  // detection
+  std::unique_ptr<BevDetector> detector_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr fg_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr det_pub_;
 };
 
 }  // namespace kiss_loc
