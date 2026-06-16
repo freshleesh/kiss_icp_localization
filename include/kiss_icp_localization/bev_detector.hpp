@@ -31,11 +31,13 @@ struct BevParams {
   double z_max = 1.5;        // ... and below this (vehicle height / drop overhead)
   bool subtract_map = true;  // drop points near the prior map (keep unmapped only)
   double map_dist = 0.3;     // a point within this of the prior map = mapped [m]
-  // clustering connects occupied cells within this distance, independent of the
-  // cell size `res`: keep res fine for precise bbox while bridging point gaps so
-  // sparse/far objects don't fragment. >= res; cost grows as (cluster_dist/res)^2.
-  double cluster_dist = 0.2; // max gap bridged when clustering [m]
-  int min_cluster_cells = 2; // discard clusters smaller than this (in `res` cells)
+  // DBSCAN over occupied cells, independent of cell size `res`: eps is the
+  // neighborhood radius and a cell needs >= min_samples occupied cells (incl.
+  // itself) within eps to be a core. Sparse cells become noise and are dropped,
+  // which rejects spurious returns. Cost grows as (eps/res)^2.
+  double eps = 0.2;          // DBSCAN neighborhood radius [m]
+  int min_samples = 4;       // min cells within eps (incl. self) for a core cell
+  int min_cluster_cells = 2; // final: discard clusters smaller than this (cells)
   double track_gate = 1.0;   // max bbox-center step to associate a track [m]
   double moving_speed = 0.5; // |v| above this  => moving (opponent) [m/s]
   int max_misses = 5;        // drop a track after this many unmatched frames

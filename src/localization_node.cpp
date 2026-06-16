@@ -22,6 +22,7 @@
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -177,12 +178,14 @@ private:
     bp.z_max = declare_parameter<double>("detect_z_max", 1.5);
     bp.subtract_map = declare_parameter<bool>("detect_subtract_map", true);
     bp.map_dist = declare_parameter<double>("detect_map_dist", 0.3);
-    bp.cluster_dist = declare_parameter<double>("detect_cluster_dist", 0.2);
+    bp.eps = declare_parameter<double>("detect_eps", 0.2);
+    bp.min_samples = declare_parameter<int>("detect_min_samples", 4);
     bp.min_cluster_cells = declare_parameter<int>("detect_min_cluster_cells", 2);
     bp.track_gate = declare_parameter<double>("detect_track_gate", 1.0);
     bp.moving_speed = declare_parameter<double>("detect_moving_speed", 0.5);
     bp.max_misses = declare_parameter<int>("detect_max_misses", 5);
     bev_params_ = bp;
+    arrow_scale_ = declare_parameter<double>("detect_arrow_scale", 0.5);
   }
 
   void loadMap() {
@@ -702,18 +705,33 @@ private:
       m.lifetime = rclcpp::Duration::from_seconds(0.3);
       arr.markers.push_back(m);
 
-      if (d.moving) {  // label only the moving objects to avoid wall clutter
-        visualization_msgs::msg::Marker txt = m;
-        txt.ns = "labels";
-        txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-        txt.pose.position.z += 0.5 * m.scale.z + 0.3;
-        txt.scale.z = 0.4;
-        txt.color.a = 1.0f;
-        txt.color.r = txt.color.g = txt.color.b = 1.0f;
-        char buf[48];
-        std::snprintf(buf, sizeof(buf), "#%d %.1fm/s", d.id, d.speed);
-        txt.text = buf;
-        arr.markers.push_back(txt);
+      if (d.moving) {  // velocity arrow: direction = heading, length ~ speed
+        visualization_msgs::msg::Marker arrow;
+        arrow.header.frame_id = map_frame_;
+        arrow.header.stamp = stamp;
+        arrow.ns = "velocity";
+        arrow.id = d.id;
+        arrow.type = visualization_msgs::msg::Marker::ARROW;
+        arrow.action = visualization_msgs::msg::Marker::ADD;
+        const double az = gz + bev_params_.z_min + std::max(0.1, d.height) + 0.2;
+        geometry_msgs::msg::Point p0, p1;
+        p0.x = d.center.x();
+        p0.y = d.center.y();
+        p0.z = az;
+        p1.x = d.center.x() + d.velocity.x() * arrow_scale_;
+        p1.y = d.center.y() + d.velocity.y() * arrow_scale_;
+        p1.z = az;
+        arrow.points.push_back(p0);
+        arrow.points.push_back(p1);
+        arrow.scale.x = 0.05;  // shaft diameter
+        arrow.scale.y = 0.12;  // head diameter
+        arrow.scale.z = 0.15;  // head length
+        arrow.color.a = 1.0f;
+        arrow.color.r = 1.0f;
+        arrow.color.g = 0.1f;
+        arrow.color.b = 0.1f;
+        arrow.lifetime = rclcpp::Duration::from_seconds(0.3);
+        arr.markers.push_back(arrow);
       }
     }
     det_pub_->publish(arr);
@@ -736,6 +754,7 @@ private:
   Eigen::Matrix3d R_il_ = Eigen::Matrix3d::Identity();
   bool detect_en_ = false;
   BevParams bev_params_;
+  double arrow_scale_ = 0.5;
 
   // map & estimation state
   VoxelHashMap map_;

@@ -66,14 +66,16 @@
     detect_ground_a: -0.00672
     detect_ground_b: -0.01499
     detect_ground_c: -0.895
-    detect_z_min: 0.15            # 지면 위 이 높이부터 (지면 노이즈 95% ±0.14m 위로) = 바닥 제거
-    detect_z_max: 1.5             # 이 높이까지 (머리 위 구조물 제외). 차 높이에 맞춰 조정
+    detect_z_min: 0.1            # 지면 위 이 높이부터 (지면 노이즈 95% ±0.14m 위로) = 바닥 제거
+    detect_z_max: 0.5             # 이 높이까지 (머리 위 구조물 제외). 차 높이에 맞춰 조정
     detect_subtract_map: true     # prior map 차분: 맵 근처 점(벽/구조물) 제거, 미지 객체만 남김
                                   #   false면 벽 포함 전부 검출(Mode A)
     detect_map_dist: 0.1          # prior map에서 이 거리 이내면 '맵에 있음'으로 제거 (m). pose 오차보다 크게
-    detect_cluster_dist: 0.1      # 클러스터 연결 거리 (m). res와 독립 — 점이 이만큼 떨어져도 한 객체로 이음
-                                  #   (조각남 방지). 비용 ∝ (cluster_dist/res)². 두 객체가 이보다 가까우면 병합
-    detect_min_cluster_cells: 2   # 이보다 작은 클러스터는 버림 (res 셀 단위)
+    # DBSCAN (밀도 기반). res 그리드를 공간 인덱스로 사용.
+    detect_eps: 0.3               # 이웃 반경 (m). res와 독립. 비용 ∝ (eps/res)²
+    detect_min_samples: 2         # eps 안에 (자기 포함) 이만큼 셀이 있어야 core. 클수록 노이즈 제거↑
+    detect_min_cluster_cells: 2   # 최종: 이보다 작은 클러스터는 버림 (res 셀 단위)
     detect_track_gate: 1.0        # bbox 중심 연관 최대 이동 (m)
     detect_moving_speed: 0.5      # |v| 초과 시 moving(opponent)으로 분류 (m/s)
     detect_max_misses: 5          # 미매칭 N프레임 후 트랙 제거
+    detect_arrow_scale: 0.5       # 속도 화살표 길이 배율 (m per m/s). 시각화 전용
