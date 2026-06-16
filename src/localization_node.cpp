@@ -72,17 +72,17 @@ public:
     publishMapCloud();
 
     if (detect_en_) {
-      detector_ = std::make_unique<BevDetector>(bev_params_);
-      fg_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-          "/kiss_loc/foreground", 5);
+      detector_ = std::make_unique<BevDetector>(bev_params_, &map_);
+      obstacle_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+          "/kiss_loc/obstacles", 5);
       det_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
           "/kiss_loc/detections", 5);
       RCLCPP_INFO(get_logger(),
-                  "BEV detection enabled: res %.2f m, z-band [%.2f, %.2f] above "
-                  "ground (%.4f,%.4f,%.3f), persist %.1f",
+                  "BEV detection enabled: res %.2f m, height band [%.2f, %.2f] "
+                  "above ground (%.4f,%.4f,%.3f), map_subtract=%d (d=%.2f)",
                   bev_params_.res, bev_params_.z_min, bev_params_.z_max,
                   bev_params_.ga, bev_params_.gb, bev_params_.gc,
-                  bev_params_.persist);
+                  bev_params_.subtract_map, bev_params_.map_dist);
     }
 
     const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
@@ -173,14 +173,14 @@ private:
     bp.ga = declare_parameter<double>("detect_ground_a", 0.0);
     bp.gb = declare_parameter<double>("detect_ground_b", 0.0);
     bp.gc = declare_parameter<double>("detect_ground_c", 0.0);
-    bp.z_min = declare_parameter<double>("detect_z_min", 0.2);
+    bp.z_min = declare_parameter<double>("detect_z_min", 0.15);
     bp.z_max = declare_parameter<double>("detect_z_max", 1.5);
-    bp.tau = declare_parameter<double>("detect_persist_tau", 1.0);
-    bp.persist = declare_parameter<double>("detect_persist", 3.0);
-    bp.min_cluster_cells = declare_parameter<int>("detect_min_cluster_cells", 3);
+    bp.subtract_map = declare_parameter<bool>("detect_subtract_map", true);
+    bp.map_dist = declare_parameter<double>("detect_map_dist", 0.3);
+    bp.cluster_dist = declare_parameter<double>("detect_cluster_dist", 0.2);
+    bp.min_cluster_cells = declare_parameter<int>("detect_min_cluster_cells", 2);
     bp.track_gate = declare_parameter<double>("detect_track_gate", 1.0);
     bp.moving_speed = declare_parameter<double>("detect_moving_speed", 0.5);
-    bp.warmup_frames = declare_parameter<int>("detect_warmup_frames", 5);
     bp.max_misses = declare_parameter<int>("detect_max_misses", 5);
     bev_params_ = bp;
   }
@@ -658,19 +658,19 @@ private:
     const BevResult res = detector_->Update(pts_map, t);
     const auto stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
 
-    // foreground cloud
-    if (fg_pub_->get_subscription_count() > 0) {
-      pcl::PointCloud<pcl::PointXYZ> fg;
-      fg.reserve(res.foreground.size());
-      for (const auto &p : res.foreground) fg.emplace_back(p.x(), p.y(), p.z());
+    // obstacle cloud (everything in the height band: walls + objects + opponent)
+    if (obstacle_pub_->get_subscription_count() > 0) {
+      pcl::PointCloud<pcl::PointXYZ> oc;
+      oc.reserve(res.obstacle_points.size());
+      for (const auto &p : res.obstacle_points) oc.emplace_back(p.x(), p.y(), p.z());
       sensor_msgs::msg::PointCloud2 msg;
-      pcl::toROSMsg(fg, msg);
+      pcl::toROSMsg(oc, msg);
       msg.header.frame_id = map_frame_;
       msg.header.stamp = stamp;
-      fg_pub_->publish(msg);
+      obstacle_pub_->publish(msg);
     }
 
-    // detection markers (cube + id/speed label per object)
+    // detection markers: bbox cube + id/speed label per cluster
     visualization_msgs::msg::MarkerArray arr;
     visualization_msgs::msg::Marker clear;
     clear.header.frame_id = map_frame_;
@@ -678,8 +678,8 @@ private:
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
     for (const auto &d : res.detections) {
-      const double gz = bev_params_.ga * d.centroid.x() +
-                        bev_params_.gb * d.centroid.y() + bev_params_.gc;
+      const double gz = bev_params_.ga * d.center.x() +
+                        bev_params_.gb * d.center.y() + bev_params_.gc;
       visualization_msgs::msg::Marker m;
       m.header.frame_id = map_frame_;
       m.header.stamp = stamp;
@@ -687,33 +687,34 @@ private:
       m.id = d.id;
       m.type = visualization_msgs::msg::Marker::CUBE;
       m.action = visualization_msgs::msg::Marker::ADD;
-      m.pose.position.x = d.centroid.x();
-      m.pose.position.y = d.centroid.y();
+      m.pose.position.x = d.center.x();
+      m.pose.position.y = d.center.y();
       m.pose.position.z = gz + bev_params_.z_min + 0.5 * std::max(0.1, d.height);
       m.pose.orientation.w = 1.0;
-      m.scale.x = std::max(0.2, 2.0 * d.extent);
-      m.scale.y = std::max(0.2, 2.0 * d.extent);
+      m.scale.x = std::max(0.1, d.size.x());
+      m.scale.y = std::max(0.1, d.size.y());
       m.scale.z = std::max(0.1, d.height);
-      m.color.a = 0.6f;
-      // moving (opponent) = red, static/unresolved = orange
-      m.color.r = 1.0f;
+      m.color.a = 0.4f;
+      // moving (opponent) = red, static (wall/obstacle) = gray
+      m.color.r = d.moving ? 1.0f : 0.6f;
       m.color.g = d.moving ? 0.1f : 0.6f;
-      m.color.b = 0.1f;
+      m.color.b = d.moving ? 0.1f : 0.6f;
       m.lifetime = rclcpp::Duration::from_seconds(0.3);
       arr.markers.push_back(m);
 
-      visualization_msgs::msg::Marker txt = m;
-      txt.ns = "labels";
-      txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-      txt.pose.position.z += 0.5 * m.scale.z + 0.3;
-      txt.scale.z = 0.4;
-      txt.color.a = 1.0f;
-      txt.color.r = txt.color.g = txt.color.b = 1.0f;
-      char buf[64];
-      std::snprintf(buf, sizeof(buf), "#%d %s %.1fm/s", d.id,
-                    d.moving ? "OPP" : "stat", d.speed);
-      txt.text = buf;
-      arr.markers.push_back(txt);
+      if (d.moving) {  // label only the moving objects to avoid wall clutter
+        visualization_msgs::msg::Marker txt = m;
+        txt.ns = "labels";
+        txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+        txt.pose.position.z += 0.5 * m.scale.z + 0.3;
+        txt.scale.z = 0.4;
+        txt.color.a = 1.0f;
+        txt.color.r = txt.color.g = txt.color.b = 1.0f;
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "#%d %.1fm/s", d.id, d.speed);
+        txt.text = buf;
+        arr.markers.push_back(txt);
+      }
     }
     det_pub_->publish(arr);
   }
@@ -766,7 +767,7 @@ private:
 
   // detection
   std::unique_ptr<BevDetector> detector_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr fg_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr det_pub_;
 };
 

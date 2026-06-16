@@ -55,22 +55,25 @@
     publish_aligned_scan: true
 
     # ---- BEV object detection (선택) ----
-    # localization 산출물(deskew+정합된 스캔)에 얹는 2D 검출. 맵에 없는 점을
-    # rolling 배경(self-healing)과 비교 → foreground 클러스터링 → 시간 트래킹으로
-    # static/moving(opponent) 구분. lock(수렴) 상태에서만 동작.
+    # localization 산출물(deskew+정합된 map-frame 스캔)에 얹는 per-frame 2D 검출.
+    # 지면평면으로 바닥 제거 → 차 높이 밴드 크롭 → 클러스터링으로 벽+장애물+상대차를
+    # 객체로 추출, centroid 트래킹으로 moving(opponent) 여부 표시. lock 상태에서만 동작.
+    # 상태 누적 없음(per-frame) → warmup/leading-edge 오탐 없음.
     detect_en: false              # 기본 off. v14 launch는 true로 켬
-    detect_res: 0.2               # BEV 셀 크기 (m)
-    # 지면 평면 z = a*x + b*y + c (map 프레임). 맵별로 다름 — 0이면 z=상수 가정.
-    # v14 값은 launch에서 오버라이드 (analyze_map_z.py로 추출)
-    detect_ground_a: 0.0
-    detect_ground_b: 0.0
-    detect_ground_c: 0.0
-    detect_z_min: 0.2             # 지면 위 이 높이부터 (지면 노이즈 95% ±0.14m 위로)
+    detect_res: 0.05               # BEV 셀 크기 (m)
+    # 지면 평면 z = a*x + b*y + c (map 프레임). 맵별로 다름 — 다른 맵은 오버라이드.
+    # 기본값은 v14 기준 (analyze_map_z.py로 추출: tilt 0.94°, 평탄도 ~5cm)
+    detect_ground_a: -0.00672
+    detect_ground_b: -0.01499
+    detect_ground_c: -0.895
+    detect_z_min: 0.15            # 지면 위 이 높이부터 (지면 노이즈 95% ±0.14m 위로) = 바닥 제거
     detect_z_max: 1.5             # 이 높이까지 (머리 위 구조물 제외). 차 높이에 맞춰 조정
-    detect_persist_tau: 1.0       # 배경 지속성 시간상수 (s)
-    detect_persist: 3.0           # 디케이 점수 ≥ 이 값이면 static 배경 (~3프레임 ≈ 0.3s)
-    detect_min_cluster_cells: 3   # 이보다 작은 클러스터는 버림
-    detect_track_gate: 1.0        # centroid 연관 최대 이동 (m)
+    detect_subtract_map: true     # prior map 차분: 맵 근처 점(벽/구조물) 제거, 미지 객체만 남김
+                                  #   false면 벽 포함 전부 검출(Mode A)
+    detect_map_dist: 0.1          # prior map에서 이 거리 이내면 '맵에 있음'으로 제거 (m). pose 오차보다 크게
+    detect_cluster_dist: 0.1      # 클러스터 연결 거리 (m). res와 독립 — 점이 이만큼 떨어져도 한 객체로 이음
+                                  #   (조각남 방지). 비용 ∝ (cluster_dist/res)². 두 객체가 이보다 가까우면 병합
+    detect_min_cluster_cells: 2   # 이보다 작은 클러스터는 버림 (res 셀 단위)
+    detect_track_gate: 1.0        # bbox 중심 연관 최대 이동 (m)
     detect_moving_speed: 0.5      # |v| 초과 시 moving(opponent)으로 분류 (m/s)
-    detect_warmup_frames: 5       # 배경 안정화 전까지 검출 보류
     detect_max_misses: 5          # 미매칭 N프레임 후 트랙 제거

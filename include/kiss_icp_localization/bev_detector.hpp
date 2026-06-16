@@ -5,62 +5,68 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kiss_icp_localization/voxel_hash_map.hpp"
+
 namespace kiss_loc {
 
-// 2D bird's-eye-view detector for unmapped objects (static obstacles +
-// opponents). It maintains a rolling per-cell persistence grid in the map
-// frame as a *self-healing background*: points whose ground-relative height
-// falls in a band are projected to 2D; a cell that has been observed for
-// several consecutive frames becomes static background, so anything newly
-// appearing (or a moved obstacle, until it settles) is foreground. Moving vs
-// static is then resolved by tracking cluster centroids over time.
+// Per-frame BEV obstacle detector. Using the localized (map-frame) scan it
+// removes the ground via the known map ground plane and crops to a vehicle-
+// height band. With map subtraction on (default), points close to the prior
+// map (walls / known structure) are dropped so only *unmapped* objects remain
+// — obstacles and the opponent; off, every cluster (walls included) is kept.
+// Survivors are projected to a 2D grid, clustered, and tracked across frames
+// so each gets a velocity / moving flag (moving => opponent).
 //
-// Localization (scan-to-prior-map ICP) is unaffected — this only consumes the
-// already-deskewed, already-localized scan, so it adds no extra registration.
+// Stateless per frame (no rolling background): nothing to warm up, no
+// leading-edge false positives as the platform drives into new area, and
+// insensitive to small pose jitter. Consumes the already-deskewed, already-
+// localized scan and the prior map, so it adds no registration. Map
+// subtraction has complete coverage (no leading-edge problem) and treats a
+// moved/new static object as an obstacle — which is the desired behavior.
 struct BevParams {
   double res = 0.2;          // BEV cell size [m]
   // ground plane in map frame: z_ground = ga*x + gb*y + gc
   double ga = 0.0, gb = 0.0, gc = 0.0;
-  double z_min = 0.2;        // keep points this far above ground [m]
-  double z_max = 1.5;        // ... and below this (drop overhead structure)
-  double tau = 1.0;          // background persistence time constant [s]
-  double persist = 3.0;      // decayed score >= persist  => static background
-  double score_cap = 20.0;   // saturate per-cell score
-  int min_cluster_cells = 3; // discard clusters smaller than this
-  double track_gate = 1.0;   // max centroid step to associate a track [m]
+  double z_min = 0.15;       // keep points this far above ground [m] (ground removal)
+  double z_max = 1.5;        // ... and below this (vehicle height / drop overhead)
+  bool subtract_map = true;  // drop points near the prior map (keep unmapped only)
+  double map_dist = 0.3;     // a point within this of the prior map = mapped [m]
+  // clustering connects occupied cells within this distance, independent of the
+  // cell size `res`: keep res fine for precise bbox while bridging point gaps so
+  // sparse/far objects don't fragment. >= res; cost grows as (cluster_dist/res)^2.
+  double cluster_dist = 0.2; // max gap bridged when clustering [m]
+  int min_cluster_cells = 2; // discard clusters smaller than this (in `res` cells)
+  double track_gate = 1.0;   // max bbox-center step to associate a track [m]
   double moving_speed = 0.5; // |v| above this  => moving (opponent) [m/s]
   int max_misses = 5;        // drop a track after this many unmatched frames
-  int warmup_frames = 5;     // emit detections only after background warms up
-  int prune_every = 50;      // sweep stale background cells every N frames
 };
 
 struct Detection {
   int id = -1;
-  Eigen::Vector2d centroid{0.0, 0.0};  // map frame [m]
+  Eigen::Vector2d center{0.0, 0.0};    // bbox center, map frame [m]
+  Eigen::Vector2d size{0.0, 0.0};      // bbox extent x,y [m]
   Eigen::Vector2d velocity{0.0, 0.0};  // map frame [m/s]
   double speed = 0.0;
   bool moving = false;
   int num_points = 0;
   int num_cells = 0;
-  double extent = 0.0;  // horizontal radius [m]
   double height = 0.0;  // cluster height above ground [m]
 };
 
 struct BevResult {
   std::vector<Detection> detections;
-  std::vector<Eigen::Vector3d> foreground;  // map-frame foreground points
+  std::vector<Eigen::Vector3d> obstacle_points;  // map-frame band-cropped points
 };
 
 class BevDetector {
 public:
-  explicit BevDetector(const BevParams &p) : p_(p) {}
+  // map: prior map for subtraction (may be null when subtract_map is false).
+  explicit BevDetector(const BevParams &p, const VoxelHashMap *map = nullptr)
+      : p_(p), map_(map) {}
 
   // points_map: deskewed scan already transformed into the map frame.
-  // stamp: scan time [s] (monotonic), used for decay and track velocity.
+  // stamp: scan time [s] (monotonic), used for track velocity.
   BevResult Update(const std::vector<Eigen::Vector3d> &points_map, double stamp);
-
-  bool WarmedUp() const { return frame_ >= p_.warmup_frames; }
-  std::size_t BackgroundCells() const { return bg_.size(); }
 
 private:
   double GroundZ(double x, double y) const { return p_.ga * x + p_.gb * y + p_.gc; }
@@ -69,13 +75,8 @@ private:
            static_cast<uint32_t>(iy);
   }
 
-  struct BgCell {
-    double score = 0.0;
-    double last = 0.0;
-  };
-
   BevParams p_;
-  std::unordered_map<int64_t, BgCell> bg_;
+  const VoxelHashMap *map_ = nullptr;
 
   struct Track {
     int id;
@@ -86,7 +87,6 @@ private:
   };
   std::vector<Track> tracks_;
   int next_id_ = 0;
-  long frame_ = 0;
 };
 
 }  // namespace kiss_loc
