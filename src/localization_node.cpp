@@ -101,6 +101,11 @@ public:
                          msg) { onInitialPose(msg); });
     }
 
+    if (crop_mode_ == CropMode::kSensor)
+      RCLCPP_INFO(get_logger(),
+                  "input ground-crop mode=sensor: keep height [%.2f, %.2f] m above "
+                  "plane n=(%.4f,%.4f,%.4f) off=%.4f (LiDAR frame)",
+                  crop_z_min_, crop_z_max_, crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_);
     RCLCPP_INFO(get_logger(),
                 "kiss_icp_localization ready: map %zu pts (voxel %.2f m), "
                 "lidar '%s' (PointCloud2), imu '%s' (imu_en=%d)",
@@ -120,6 +125,23 @@ private:
     min_range_ = declare_parameter<double>("min_range", 0.3);
     max_range_ = declare_parameter<double>("max_range", 60.0);
     point_filter_num_ = declare_parameter<int>("point_filter_num", 1);
+
+    // ---- ground-band input crop ----
+    // mode "off"    : no crop (full scan, range-only).
+    // mode "sensor" : keep only points whose height above the ground plane is in
+    //   [crop_z_min, crop_z_max], so the scan matches a map cropped to the same
+    //   band. Plane is in the LiDAR frame — a constant LiDAR<->ground extrinsic
+    //   from GLIM (normal = R_map_lidar^T * n_map, offset = n_map.t_lidar + d).
+    //   height(p) = crop_n_.p + crop_h_.  Applied pre-deskew in keepPoint().
+    const std::string cmode = declare_parameter<std::string>("crop_ground_mode", "off");
+    crop_mode_ = (cmode == "sensor") ? CropMode::kSensor : CropMode::kOff;
+    auto cn = declare_parameter<std::vector<double>>("crop_ground_normal", {0.0, 0.0, 1.0});
+    crop_n_ = (cn.size() == 3) ? Eigen::Vector3d(cn[0], cn[1], cn[2])
+                               : Eigen::Vector3d(0.0, 0.0, 1.0);
+    if (crop_n_.norm() > 1e-9) crop_n_.normalize();
+    crop_h_ = declare_parameter<double>("crop_ground_offset", 0.0);
+    crop_z_min_ = declare_parameter<double>("crop_z_min", 0.05);
+    crop_z_max_ = declare_parameter<double>("crop_z_max", 0.30);
 
     lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/livox/lidar");
     imu_topic_ = declare_parameter<std::string>("imu_topic", "/livox/imu");
@@ -339,7 +361,12 @@ private:
   bool keepPoint(float x, float y, float z) const {
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
     const double r2 = double(x) * x + double(y) * y + double(z) * z;
-    return r2 > min_range_ * min_range_ && r2 < max_range_ * max_range_;
+    if (r2 <= min_range_ * min_range_ || r2 >= max_range_ * max_range_) return false;
+    if (crop_mode_ == CropMode::kSensor) {
+      const double hgt = crop_n_.x() * x + crop_n_.y() * y + crop_n_.z() * z + crop_h_;
+      if (hgt < crop_z_min_ || hgt > crop_z_max_) return false;
+    }
+    return true;
   }
 
   void onImu(const sensor_msgs::msg::Imu::SharedPtr msg) {
@@ -752,6 +779,11 @@ private:
       use_normals_;
   std::vector<double> initial_pose_;
   Eigen::Matrix3d R_il_ = Eigen::Matrix3d::Identity();
+  // ground-band input crop
+  enum class CropMode { kOff, kSensor };
+  CropMode crop_mode_ = CropMode::kOff;
+  Eigen::Vector3d crop_n_ = Eigen::Vector3d::UnitZ();
+  double crop_h_ = 0.0, crop_z_min_ = 0.05, crop_z_max_ = 0.30;
   bool detect_en_ = false;
   BevParams bev_params_;
   double arrow_scale_ = 0.5;

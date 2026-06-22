@@ -13,6 +13,16 @@
     max_range: 60.0
     point_filter_num: 1         # N점 중 1점 사용 (1=전부)
 
+    # ---- ground-band input crop (지면 밴드 입력 crop) ----
+    # 맵을 지면밴드로 crop(map_ground.pcd)했을 때, 스캔도 같은 밴드만 ICP에 넣어 정합 일관성 유지.
+    crop_ground_mode: "sensor"     # "off" = crop 없음 | "sensor" = 센서프레임 고정평면으로 crop
+    # 센서프레임 지면평면 (= 라이다↔지면 extrinsic). GLIM 파이프라인이 ground_lidar.yaml로 뽑아줌.
+    #   height(p) = crop_ground_normal·p + crop_ground_offset,  crop_z_min ≤ height ≤ crop_z_max 만 통과
+    crop_ground_normal: [0.0, 0.0, 1.0]   # 센서프레임 지면 normal(위 방향) = R_map_lidar^T · n_map (궤적 median)
+    crop_ground_offset: 0.0               # 라이다의 지면 위 높이 h = n_map·t_lidar + d
+    crop_z_min: 0.05            # 지면 위 남길 최저 높이 (m) — 맵 crop의 z_min과 동일하게
+    crop_z_max: 0.3             # 지면 위 남길 최고 높이 (m) — 맵 crop의 z_max와 동일하게
+
     # ---- input ----
     lidar_topic: "/livox/lidar"   # sensor_msgs/PointCloud2
     imu_topic: "/livox/imu"
@@ -22,7 +32,7 @@
     # ---- IMU ----
     imu_en: true
     deskew_en: true             # gyro 적분으로 스캔 내 회전 왜곡 보정
-    imu_rate_odom: true         # 라이다 프레임 사이 IMU 전파 odometry 발행
+    imu_rate_odom: true         # 라이다 프레임 사이 IMU로 고-hz pose 전파 (ICP가 스캔마다 보정)
     imu_init_samples: 100       # 정지 상태 자이로 바이어스 초기화 샘플 수 (200Hz → 0.5s)
     # LiDAR→IMU 회전 외참 (row-major). MID360 내장 IMU는 identity
     extrinsic_R_il: [1.0, 0.0, 0.0,
@@ -51,7 +61,7 @@
     use_initial_pose_topic: true                    # /initialpose (RViz 2D Pose Estimate)
     map_frame: "map"
     base_frame: "base_link"
-    publish_tf: true
+    publish_tf: false           # TF는 발행 안 함 — pose는 /kiss_loc/odometry로 발행
     publish_aligned_scan: true
 
     # ---- BEV object detection (선택) ----
