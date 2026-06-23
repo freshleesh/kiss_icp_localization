@@ -25,10 +25,13 @@ namespace kiss_loc {
 // moved/new static object as an obstacle — which is the desired behavior.
 struct BevParams {
   double res = 0.2;          // BEV cell size [m]
-  // ground plane in map frame: z_ground = ga*x + gb*y + gc
-  double ga = 0.0, gb = 0.0, gc = 0.0;
-  double z_min = 0.15;       // keep points this far above ground [m] (ground removal)
-  double z_max = 1.5;        // ... and below this (vehicle height / drop overhead)
+  // Ground plane comes from ground_lidar.yaml (GLIM): the same sensor-frame
+  // plane used to crop the localization input scan. It is passed to Update()
+  // already transformed into the map frame for the just-solved pose, so the
+  // height of a point p is ground_normal.p + ground_offset. The z-band below
+  // matches crop_z_min/crop_z_max from that yaml.
+  double z_min = 0.05;       // keep points this far above ground [m] (ground removal)
+  double z_max = 0.30;       // ... and below this (drop overhead)
   bool subtract_map = true;  // drop points near the prior map (keep unmapped only)
   double map_dist = 0.3;     // a point within this of the prior map = mapped [m]
   // DBSCAN over occupied cells, independent of cell size `res`: eps is the
@@ -68,10 +71,13 @@ public:
 
   // points_map: deskewed scan already transformed into the map frame.
   // stamp: scan time [s] (monotonic), used for track velocity.
-  BevResult Update(const std::vector<Eigen::Vector3d> &points_map, double stamp);
+  // ground_normal / ground_offset: ground plane in the map frame (the GLIM
+  // sensor-frame plane from ground_lidar.yaml rotated by the current pose);
+  // height above ground of a point p is ground_normal.dot(p) + ground_offset.
+  BevResult Update(const std::vector<Eigen::Vector3d> &points_map, double stamp,
+                   const Eigen::Vector3d &ground_normal, double ground_offset);
 
 private:
-  double GroundZ(double x, double y) const { return p_.ga * x + p_.gb * y + p_.gc; }
   static int64_t CellKey(int ix, int iy) {
     return (static_cast<int64_t>(static_cast<uint32_t>(ix)) << 32) |
            static_cast<uint32_t>(iy);

@@ -18,7 +18,9 @@ struct Obs {
 }  // namespace
 
 BevResult BevDetector::Update(const std::vector<Eigen::Vector3d> &points_map,
-                              double stamp) {
+                              double stamp,
+                              const Eigen::Vector3d &ground_normal,
+                              double ground_offset) {
   BevResult out;
   const double inv_res = 1.0 / p_.res;
 
@@ -30,7 +32,7 @@ BevResult BevDetector::Update(const std::vector<Eigen::Vector3d> &points_map,
   out.obstacle_points.reserve(points_map.size() / 4 + 16);
   MapPoint mp;
   for (const auto &p : points_map) {
-    const double r = p.z() - GroundZ(p.x(), p.y());
+    const double r = ground_normal.dot(p) + ground_offset;  // height above ground
     if (r < p_.z_min || r > p_.z_max) continue;  // ground / overhead removed
     // drop points that belong to the prior map (walls / known structure)
     if (do_subtract && map_->GetClosestNeighbor(p, p_.map_dist, mp)) continue;

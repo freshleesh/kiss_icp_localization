@@ -71,13 +71,9 @@
     # 상태 누적 없음(per-frame) → warmup/leading-edge 오탐 없음.
     detect_en: false              # 기본 off. v14 launch는 true로 켬
     detect_res: 0.05               # BEV 셀 크기 (m)
-    # 지면 평면 z = a*x + b*y + c (map 프레임). 맵별로 다름 — 다른 맵은 오버라이드.
-    # 기본값은 v14 기준 (analyze_map_z.py로 추출: tilt 0.94°, 평탄도 ~5cm)
-    detect_ground_a: -0.00672
-    detect_ground_b: -0.01499
-    detect_ground_c: -0.895
-    detect_z_min: 0.1            # 지면 위 이 높이부터 (지면 노이즈 95% ±0.14m 위로) = 바닥 제거
-    detect_z_max: 0.5             # 이 높이까지 (머리 위 구조물 제외). 차 높이에 맞춰 조정
+    # 지면 제거 + 높이 크롭은 위 crop_ground_* / crop_z_min/max (ground_lidar.yaml)를
+    # 그대로 사용 — localization 입력 crop과 단일 소스. 센서프레임 평면을 매 프레임
+    # 현재 pose로 map 프레임에 회전시켜 적용. 별도 detect_ground_*/detect_z_* 없음.
     detect_subtract_map: true     # prior map 차분: 맵 근처 점(벽/구조물) 제거, 미지 객체만 남김
                                   #   false면 벽 포함 전부 검출(Mode A)
     detect_map_dist: 0.1          # prior map에서 이 거리 이내면 '맵에 있음'으로 제거 (m). pose 오차보다 크게

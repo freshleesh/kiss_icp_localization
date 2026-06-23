@@ -80,9 +80,10 @@ public:
           "/kiss_loc/detections", 5);
       RCLCPP_INFO(get_logger(),
                   "BEV detection enabled: res %.2f m, height band [%.2f, %.2f] "
-                  "above ground (%.4f,%.4f,%.3f), map_subtract=%d (d=%.2f)",
+                  "above GLIM ground n=(%.4f,%.4f,%.4f) off=%.4f, "
+                  "map_subtract=%d (d=%.2f)",
                   bev_params_.res, bev_params_.z_min, bev_params_.z_max,
-                  bev_params_.ga, bev_params_.gb, bev_params_.gc,
+                  crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_,
                   bev_params_.subtract_map, bev_params_.map_dist);
     }
 
@@ -192,12 +193,12 @@ private:
     detect_en_ = declare_parameter<bool>("detect_en", false);
     BevParams bp;
     bp.res = declare_parameter<double>("detect_res", 0.2);
-    // ground plane in map frame: z = ga*x + gb*y + gc (from map z-analysis)
-    bp.ga = declare_parameter<double>("detect_ground_a", 0.0);
-    bp.gb = declare_parameter<double>("detect_ground_b", 0.0);
-    bp.gc = declare_parameter<double>("detect_ground_c", 0.0);
-    bp.z_min = declare_parameter<double>("detect_z_min", 0.15);
-    bp.z_max = declare_parameter<double>("detect_z_max", 1.5);
+    // ground removal + height crop reuse the GLIM ground plane and z-band from
+    // ground_lidar.yaml (crop_ground_normal/offset, crop_z_min/z_max) — single
+    // source of truth with the localization input crop. The plane is in the
+    // sensor frame; runDetection() rotates it into the map frame per pose.
+    bp.z_min = crop_z_min_;
+    bp.z_max = crop_z_max_;
     bp.subtract_map = declare_parameter<bool>("detect_subtract_map", true);
     bp.map_dist = declare_parameter<double>("detect_map_dist", 0.3);
     bp.eps = declare_parameter<double>("detect_eps", 0.2);
@@ -685,10 +686,22 @@ private:
     pts_map.reserve(scan_sensor.size());
     for (const auto &p : scan_sensor) pts_map.push_back(T_ * p);
 
-    const BevResult res = detector_->Update(pts_map, t);
+    // GLIM ground plane (sensor frame) rotated into the map frame for this pose:
+    // height(p_map) = n_map.p_map + h_map, identical to the sensor-frame height.
+    const Eigen::Vector3d n_map = T_.rotation() * crop_n_;
+    const double h_map = crop_h_ - n_map.dot(T_.translation());
+    // ground z at (x,y): solve n_map.(x,y,z) + h_map = 0 for marker placement
+    const double nz = (std::abs(n_map.z()) > 1e-6) ? n_map.z() : 1e-6;
+    auto ground_z = [&](double x, double y) {
+      return -(n_map.x() * x + n_map.y() * y + h_map) / nz;
+    };
+
+    const BevResult res = detector_->Update(pts_map, t, n_map, h_map);
     const auto stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
 
-    // obstacle cloud (everything in the height band: walls + objects + opponent)
+    // foreground cloud: points after ground removal + map subtraction only,
+    // i.e. the BEV detector's input *before* DBSCAN clustering / tracking
+    // (subtract_map on => walls dropped, unmapped objects + opponent kept)
     if (obstacle_pub_->get_subscription_count() > 0) {
       pcl::PointCloud<pcl::PointXYZ> oc;
       oc.reserve(res.obstacle_points.size());
@@ -708,8 +721,7 @@ private:
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
     for (const auto &d : res.detections) {
-      const double gz = bev_params_.ga * d.center.x() +
-                        bev_params_.gb * d.center.y() + bev_params_.gc;
+      const double gz = ground_z(d.center.x(), d.center.y());
       visualization_msgs::msg::Marker m;
       m.header.frame_id = map_frame_;
       m.header.stamp = stamp;

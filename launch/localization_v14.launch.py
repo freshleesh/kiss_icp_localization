@@ -40,12 +40,10 @@ def launch_setup(context, *args, **kwargs):
                 config,
                 {
                     "map_pcd_path": MAP_PCD,
-                    # BEV detection on, with the v14 ground plane measured by
-                    # analyze_map_z.py (tilt 0.94 deg, floor flat to ~5 cm)
+                    # BEV detection on. Ground removal + height crop reuse the
+                    # GLIM ground plane from ground_lidar.yaml (crop_ground_* /
+                    # crop_z_min/max in config) — no separate detect ground params.
                     "detect_en": True,
-                    "detect_ground_a": -0.00672,
-                    "detect_ground_b": -0.01499,
-                    "detect_ground_c": -0.895,
                 },
             ],
         )
