@@ -12,30 +12,22 @@ automatically so the localization input scan is cropped to the same z-band as th
 map. Override the path with `ground_yaml:=`, or leave it absent to fall back to the
 config's crop params.
 
-`show_2d_map:=true` (default) also brings up nav2 map_server publishing the
-2D occupancy grid (<map_pcd dir>/map_2d.yaml, e.g. GLIM's map_2d.pgm) on /map
-as a lightweight RViz backdrop -- far cheaper to render than the 12M-pt cloud.
-The server self-activates (no lifecycle_manager needed). Override the yaml with
-map_2d:=/abs/path/to/foo.yaml.
+The node publishes the 2D occupancy grid (<map_pcd dir>/map_2d.yaml, e.g. GLIM's
+map_2d.pgm) on /map itself as a lightweight RViz backdrop -- far cheaper to render
+than the full cloud. Override the yaml with map_2d:=/abs/path/to/foo.yaml.
 """
 import os
 
-import lifecycle_msgs.msg
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
-    EmitEvent,
     LogInfo,
     OpaqueFunction,
-    RegisterEventHandler,
     SetEnvironmentVariable,
 )
-from launch.events import matches_action
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import LifecycleNode, Node
-from launch_ros.event_handlers import OnStateTransition
-from launch_ros.events.lifecycle import ChangeState
+from launch_ros.actions import Node
 
 
 def launch_setup(context, *args, **kwargs):
@@ -59,11 +51,9 @@ def launch_setup(context, *args, **kwargs):
     else:
         info.append(LogInfo(
             msg=f"[kiss_loc] no ground_lidar.yaml at {ground_yaml} -> using config crop params"))
-    # The node now publishes the 2D OccupancyGrid on /map itself (no
-    # nav2_map_server). Only let the legacy map_server path below own /map
-    # when show_2d_map:=true, to avoid two publishers on the same topic.
-    use_map_server = LaunchConfiguration("show_2d_map").perform(context).lower() == "true"
-    node_params = {"map_pcd_path": map_pcd, "publish_2d_map": not use_map_server}
+    # The node publishes the 2D OccupancyGrid on /map itself (config
+    # publish_2d_map: true). map_2d:= overrides the yaml it reads.
+    node_params = {"map_pcd_path": map_pcd}
     map_2d_arg = LaunchConfiguration("map_2d").perform(context)
     if map_2d_arg:
         node_params["map_2d_yaml"] = map_2d_arg
@@ -82,42 +72,6 @@ def launch_setup(context, *args, **kwargs):
             remappings=[("/kiss_loc/odometry", "/car_state/odom")],
         )
     ]
-
-    if LaunchConfiguration("show_2d_map").perform(context).lower() == "true":
-        map_2d = LaunchConfiguration("map_2d").perform(context)
-        if not map_2d:
-            map_2d = os.path.join(os.path.dirname(map_pcd), "map_2d.yaml")
-        map_server = LifecycleNode(
-            package="nav2_map_server",
-            executable="map_server",
-            name="map_server",
-            namespace="",
-            output="screen",
-            parameters=[{"yaml_filename": map_2d, "frame_id": "map"}],
-        )
-        # self-activate without nav2_lifecycle_manager:
-        # configure on launch, then activate once it reaches 'inactive'.
-        configure = EmitEvent(
-            event=ChangeState(
-                lifecycle_node_matcher=matches_action(map_server),
-                transition_id=lifecycle_msgs.msg.Transition.TRANSITION_CONFIGURE,
-            )
-        )
-        activate = RegisterEventHandler(
-            OnStateTransition(
-                target_lifecycle_node=map_server,
-                goal_state="inactive",
-                entities=[
-                    EmitEvent(
-                        event=ChangeState(
-                            lifecycle_node_matcher=matches_action(map_server),
-                            transition_id=lifecycle_msgs.msg.Transition.TRANSITION_ACTIVATE,
-                        )
-                    )
-                ],
-            )
-        )
-        nodes += [map_server, activate, configure]
 
     if LaunchConfiguration("use_rviz").perform(context).lower() == "true":
         nodes.append(
@@ -145,14 +99,10 @@ def generate_launch_description():
                 description="Absolute path to the map PCD to load.",
             ),
             DeclareLaunchArgument(
-                "show_2d_map",
-                default_value="true",
-                description="Bring up nav2 map_server for the 2D occupancy grid.",
-            ),
-            DeclareLaunchArgument(
                 "map_2d",
                 default_value="",
-                description="2D map yaml. If empty, uses <map_pcd dir>/map_2d.yaml.",
+                description="2D occupancy grid yaml the node publishes on /map. "
+                "If empty, uses <map_pcd dir>/map_2d.yaml.",
             ),
             DeclareLaunchArgument(
                 "ground_yaml",
