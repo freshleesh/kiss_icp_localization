@@ -59,7 +59,15 @@ def launch_setup(context, *args, **kwargs):
     else:
         info.append(LogInfo(
             msg=f"[kiss_loc] no ground_lidar.yaml at {ground_yaml} -> using config crop params"))
-    params.append({"map_pcd_path": map_pcd})
+    # The node now publishes the 2D OccupancyGrid on /map itself (no
+    # nav2_map_server). Only let the legacy map_server path below own /map
+    # when show_2d_map:=true, to avoid two publishers on the same topic.
+    use_map_server = LaunchConfiguration("show_2d_map").perform(context).lower() == "true"
+    node_params = {"map_pcd_path": map_pcd, "publish_2d_map": not use_map_server}
+    map_2d_arg = LaunchConfiguration("map_2d").perform(context)
+    if map_2d_arg:
+        node_params["map_2d_yaml"] = map_2d_arg
+    params.append(node_params)
 
     nodes = list(info) + [
         Node(
@@ -68,6 +76,7 @@ def launch_setup(context, *args, **kwargs):
             name="kiss_icp_localization",
             output="screen",
             parameters=params,
+            remappings=[("/kiss_loc/odometry", "/car_state/odom")],
         )
     ]
 
@@ -129,7 +138,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "map_pcd",
-                default_value="/home/leesh/ros2_ws/maps_glim/ifac_1/map.pcd",
+                default_value="/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map.pcd",
                 description="Absolute path to the map PCD to load.",
             ),
             DeclareLaunchArgument(

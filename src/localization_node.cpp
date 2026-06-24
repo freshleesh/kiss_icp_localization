@@ -7,11 +7,15 @@
 //   constant body velocity and published at IMU rate.
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <deque>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -23,8 +27,10 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -64,7 +70,7 @@ public:
     adaptive_ = std::make_unique<AdaptiveThreshold>(
         initial_threshold_, min_threshold_, min_motion_, adaptive_range_);
 
-    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/kiss_loc/odometry", 50);
+    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 50);
     aligned_pub_ =
         create_publisher<sensor_msgs::msg::PointCloud2>("/kiss_loc/scan_aligned", 5);
     map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -72,12 +78,20 @@ public:
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     publishMapCloud();
 
+    if (publish_2d_map_) {
+      grid_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
+          map_2d_topic_, rclcpp::QoS(1).transient_local());
+      if (load2DMap()) publish2DMap();
+    }
+
     if (detect_en_) {
       detector_ = std::make_unique<BevDetector>(bev_params_, &map_);
       obstacle_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-          "/kiss_loc/obstacles", 5);
+          obstacle_topic_, 5);
       det_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-          "/kiss_loc/detections", 5);
+          detection_topic_, 5);
+      obstacle_pose_pub_ = create_publisher<geometry_msgs::msg::PoseArray>(
+          obstacle_pose_topic_, 5);
       RCLCPP_INFO(get_logger(),
                   "BEV detection enabled: res %.2f m, height band [%.2f, %.2f] "
                   "above GLIM ground n=(%.4f,%.4f,%.4f) off=%.4f, "
@@ -186,6 +200,12 @@ private:
     print_stats_ = declare_parameter<bool>("print_stats", false);
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+    odom_topic_ = declare_parameter<std::string>("odom_topic", "/kiss_loc/odometry");
+    // 2D occupancy grid: published by the node itself (no nav2_map_server).
+    // map_2d_yaml empty -> derive <map_pcd dir>/map_2d.yaml.
+    publish_2d_map_ = declare_parameter<bool>("publish_2d_map", true);
+    map_2d_topic_ = declare_parameter<std::string>("map_2d_topic", "/map");
+    map_2d_yaml_ = declare_parameter<std::string>("map_2d_yaml", "");
     publish_tf_ = declare_parameter<bool>("publish_tf", true);
     publish_aligned_scan_ = declare_parameter<bool>("publish_aligned_scan", true);
 
@@ -209,6 +229,16 @@ private:
     bp.max_misses = declare_parameter<int>("detect_max_misses", 5);
     bev_params_ = bp;
     arrow_scale_ = declare_parameter<double>("detect_arrow_scale", 0.5);
+    // output topics (yaml-configurable): foreground/obstacle cloud + detection
+    // markers. Defaults preserve the historical /kiss_loc/* names.
+    obstacle_topic_ =
+        declare_parameter<std::string>("detect_obstacle_topic", "/kiss_loc/obstacles");
+    detection_topic_ =
+        declare_parameter<std::string>("detect_marker_topic", "/kiss_loc/detections");
+    // DBSCAN cluster centers as PoseArray (map frame) — e.g. feed MPCC's
+    // /external_obstacles. Each pose.position = cluster bbox center.
+    obstacle_pose_topic_ =
+        declare_parameter<std::string>("detect_pose_topic", "/kiss_loc/obstacle_poses");
   }
 
   void loadMap() {
@@ -278,6 +308,133 @@ private:
     msg.header.frame_id = map_frame_;
     msg.header.stamp = now();
     map_pub_->publish(msg);
+  }
+
+  // Parse a standard map_server YAML (image/resolution/origin/negate/
+  // occupied_thresh/free_thresh) + binary P5 PGM into an OccupancyGrid.
+  // Self-contained (no nav2_map_server / yaml-cpp). Returns false on any
+  // missing/unreadable file so the node just skips /map publishing.
+  bool load2DMap() {
+    std::string yaml_path = map_2d_yaml_;
+    if (yaml_path.empty()) {
+      if (map_pcd_path_.empty()) return false;
+      const auto slash = map_pcd_path_.find_last_of('/');
+      const std::string dir =
+          (slash == std::string::npos) ? "." : map_pcd_path_.substr(0, slash);
+      yaml_path = dir + "/map_2d.yaml";
+    }
+    std::ifstream yf(yaml_path);
+    if (!yf) {
+      RCLCPP_WARN(get_logger(), "2D map yaml not found: %s -> skip /map publish",
+                  yaml_path.c_str());
+      return false;
+    }
+    auto trim = [](std::string &s) {
+      const size_t a = s.find_first_not_of(" \t\r\n");
+      if (a == std::string::npos) { s.clear(); return; }
+      const size_t b = s.find_last_not_of(" \t\r\n");
+      s = s.substr(a, b - a + 1);
+    };
+    std::string image;
+    double resolution = 0.05, ox = 0, oy = 0, oyaw = 0;
+    int negate = 0;
+    double occ_th = 0.65, free_th = 0.196;
+    std::string line;
+    while (std::getline(yf, line)) {
+      const auto hash = line.find('#');
+      if (hash != std::string::npos) line = line.substr(0, hash);
+      const auto colon = line.find(':');
+      if (colon == std::string::npos) continue;
+      std::string key = line.substr(0, colon), val = line.substr(colon + 1);
+      trim(key); trim(val);
+      if (key == "image") image = val;
+      else if (key == "resolution") resolution = std::stod(val);
+      else if (key == "negate") negate = std::stoi(val);
+      else if (key == "occupied_thresh") occ_th = std::stod(val);
+      else if (key == "free_thresh") free_th = std::stod(val);
+      else if (key == "origin") {
+        for (char &c : val) if (c == '[' || c == ']' || c == ',') c = ' ';
+        std::istringstream iss(val);
+        iss >> ox >> oy >> oyaw;
+      }
+    }
+    if (image.empty()) return false;
+    std::string img_path = image;
+    if (image[0] != '/') {
+      const auto slash = yaml_path.find_last_of('/');
+      const std::string dir =
+          (slash == std::string::npos) ? "." : yaml_path.substr(0, slash);
+      img_path = dir + "/" + image;
+    }
+    std::ifstream img(img_path, std::ios::binary);
+    if (!img) {
+      RCLCPP_WARN(get_logger(), "2D map image not found: %s", img_path.c_str());
+      return false;
+    }
+    std::string magic;
+    img >> magic;
+    if (magic != "P5") {
+      RCLCPP_WARN(get_logger(), "2D map PGM not binary P5 (%s): %s",
+                  magic.c_str(), img_path.c_str());
+      return false;
+    }
+    // read width/height/maxval, skipping '#' comment lines
+    auto read_uint = [&](std::istream &is) -> long {
+      while (true) {
+        const int c = is.peek();
+        if (c == EOF) return -1;
+        if (c == '#') { std::string d; std::getline(is, d); continue; }
+        if (std::isspace(c)) { is.get(); continue; }
+        break;
+      }
+      long v = -1;
+      is >> v;
+      return v;
+    };
+    const long w = read_uint(img), h = read_uint(img), maxval = read_uint(img);
+    if (w <= 0 || h <= 0 || maxval <= 0) return false;
+    img.get();  // consume the single whitespace after maxval
+    std::vector<uint8_t> pix(static_cast<size_t>(w) * h);
+    img.read(reinterpret_cast<char *>(pix.data()),
+             static_cast<std::streamsize>(pix.size()));
+    if (static_cast<size_t>(img.gcount()) != pix.size()) {
+      RCLCPP_WARN(get_logger(), "2D map PGM truncated: %s", img_path.c_str());
+      return false;
+    }
+    grid_msg_ = nav_msgs::msg::OccupancyGrid();
+    grid_msg_.header.frame_id = map_frame_;
+    grid_msg_.info.resolution = static_cast<float>(resolution);
+    grid_msg_.info.width = static_cast<uint32_t>(w);
+    grid_msg_.info.height = static_cast<uint32_t>(h);
+    grid_msg_.info.origin.position.x = ox;
+    grid_msg_.info.origin.position.y = oy;
+    grid_msg_.info.origin.orientation.z = std::sin(oyaw * 0.5);
+    grid_msg_.info.origin.orientation.w = std::cos(oyaw * 0.5);
+    grid_msg_.data.resize(static_cast<size_t>(w) * h);
+    // PGM row 0 is the top; OccupancyGrid row 0 is the bottom -> flip vertically.
+    for (long y = 0; y < h; ++y) {
+      for (long x = 0; x < w; ++x) {
+        const uint8_t v = pix[static_cast<size_t>(y) * w + x];
+        const double p = (negate ? v : 255 - v) / 255.0;  // occupancy prob
+        int8_t occ = -1;
+        if (p > occ_th) occ = 100;
+        else if (p < free_th) occ = 0;
+        const long gy = h - 1 - y;
+        grid_msg_.data[static_cast<size_t>(gy) * w + x] = occ;
+      }
+    }
+    grid_ready_ = true;
+    RCLCPP_INFO(get_logger(),
+                "2D map loaded: %ldx%ld res %.3f origin (%.2f,%.2f) <- %s",
+                w, h, resolution, ox, oy, img_path.c_str());
+    return true;
+  }
+
+  void publish2DMap() {
+    if (!grid_ready_ || !grid_pub_) return;
+    grid_msg_.header.stamp = now();
+    grid_msg_.info.map_load_time = now();
+    grid_pub_->publish(grid_msg_);
   }
 
   // --------------------------- callbacks ---------------------------
@@ -424,6 +581,9 @@ private:
     adaptive_->Reset();
     RCLCPP_WARN(get_logger(), "re-anchored from /initialpose: [%.2f %.2f %.2f]",
                 T.translation().x(), T.translation().y(), T.translation().z());
+    // re-publish both map layers so RViz (and any late subscriber) refreshes
+    publishMapCloud();
+    publish2DMap();
   }
 
   // ------------------------- scan processing -------------------------
@@ -713,6 +873,12 @@ private:
       obstacle_pub_->publish(msg);
     }
 
+    // cluster centers as PoseArray (map frame) — published every cycle
+    // (empty list included) so consumers (e.g. MPCC) use overwrite semantics.
+    geometry_msgs::msg::PoseArray poses;
+    poses.header.frame_id = map_frame_;
+    poses.header.stamp = stamp;
+
     // detection markers: bbox cube + id/speed label per cluster
     visualization_msgs::msg::MarkerArray arr;
     visualization_msgs::msg::Marker clear;
@@ -722,6 +888,14 @@ private:
     arr.markers.push_back(clear);
     for (const auto &d : res.detections) {
       const double gz = ground_z(d.center.x(), d.center.y());
+
+      geometry_msgs::msg::Pose pose;
+      pose.position.x = d.center.x();
+      pose.position.y = d.center.y();
+      pose.position.z = gz;  // ground level; consumers typically use x,y only
+      pose.orientation.w = 1.0;
+      poses.poses.push_back(pose);
+
       visualization_msgs::msg::Marker m;
       m.header.frame_id = map_frame_;
       m.header.stamp = stamp;
@@ -774,6 +948,7 @@ private:
       }
     }
     det_pub_->publish(arr);
+    obstacle_pose_pub_->publish(poses);
   }
 
   // --------------------------- members ---------------------------
@@ -797,6 +972,12 @@ private:
   Eigen::Vector3d crop_n_ = Eigen::Vector3d::UnitZ();
   double crop_h_ = 0.0, crop_z_min_ = 0.05, crop_z_max_ = 0.30;
   bool detect_en_ = false;
+  std::string odom_topic_, obstacle_topic_, detection_topic_, obstacle_pose_topic_;
+  // 2D occupancy grid (self-published, no nav2_map_server)
+  bool publish_2d_map_ = true;
+  std::string map_2d_topic_, map_2d_yaml_;
+  nav_msgs::msg::OccupancyGrid grid_msg_;
+  bool grid_ready_ = false;
   BevParams bev_params_;
   double arrow_scale_ = 0.5;
 
@@ -832,6 +1013,8 @@ private:
   std::unique_ptr<BevDetector> detector_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr det_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr obstacle_pose_pub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_pub_;
 };
 
 }  // namespace kiss_loc
