@@ -67,6 +67,9 @@ def launch_setup(context, *args, **kwargs):
     map_2d_arg = LaunchConfiguration("map_2d").perform(context)
     if map_2d_arg:
         node_params["map_2d_yaml"] = map_2d_arg
+    # stage-2 detection filter: 2D track mask. Empty -> node uses
+    # <map_pcd dir>/map_track.yaml (GLIM output); skipped if the file is absent.
+    node_params["track_map_yaml"] = LaunchConfiguration("track_map").perform(context)
     params.append(node_params)
 
     nodes = list(info) + [
@@ -156,6 +159,12 @@ def generate_launch_description():
                 default_value="",
                 description="Ground-crop param yaml. If empty, uses "
                 "<map_pcd dir>/ground_lidar.yaml (GLIM output); skipped if absent.",
+            ),
+            DeclareLaunchArgument(
+                "track_map",
+                default_value="",
+                description="2D track mask yaml for the stage-2 detection filter. "
+                "If empty, the node uses <map_pcd dir>/map_track.yaml (GLIM output).",
             ),
             DeclareLaunchArgument("use_rviz", default_value="false"),
             OpaqueFunction(function=launch_setup),

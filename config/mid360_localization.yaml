@@ -79,9 +79,18 @@
     # 지면 제거 + 높이 크롭은 위 crop_ground_* / crop_z_min/max (ground_lidar.yaml)를
     # 그대로 사용 — localization 입력 crop과 단일 소스. 센서프레임 평면을 매 프레임
     # 현재 pose로 map 프레임에 회전시켜 적용. 별도 detect_ground_*/detect_z_* 없음.
-    detect_subtract_map: true     # prior map 차분: 맵 근처 점(벽/구조물) 제거, 미지 객체만 남김
+    # 2단계 map subtraction:
+    #   stage-1 = prior map(2.5d) 근접 점 제거 (아래 detect_subtract_map/map_dist)
+    #   stage-2 = track 바닥마스크(map_track) 밖 점 제거 (아래 detect_track_filter/margin)
+    detect_subtract_map: true     # stage-1: 맵 근처 점(벽/구조물) 제거, 미지 객체만 남김
                                   #   false면 벽 포함 전부 검출(Mode A)
     detect_map_dist: 0.2          # prior map에서 이 거리 이내면 '맵에 있음'으로 제거 (m). pose 오차보다 크게
+    # stage-2: GLIM map_track(점유격자 free 영역 = 주행 가능 트랙) 밖 검출 제거.
+    # 맵 정보가 없는 트랙 밖에서 생기는 오탐(off-track false positive)을 차단.
+    # 법선방향 = 위 z밴드 crop, 법선수직(in-plane) = 이 트랙 거리 필터.
+    detect_track_filter: true     # track 마스크 밖 점 제거
+    detect_track_margin: 0.3      # 트랙 경계 밖 허용 수평거리 (m). 초과 시 제거
+    track_map_yaml: ""            # 비우면 <map dir>/map_track.yaml 자동 사용
     # DBSCAN (밀도 기반). res 그리드를 공간 인덱스로 사용.
     detect_eps: 0.3               # 이웃 반경 (m). res와 독립. 비용 ∝ (eps/res)²
     detect_min_samples: 2         # eps 안에 (자기 포함) 이만큼 셀이 있어야 core. 클수록 노이즈 제거↑

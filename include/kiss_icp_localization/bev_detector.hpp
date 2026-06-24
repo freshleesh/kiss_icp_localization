@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kiss_icp_localization/track_mask.hpp"
 #include "kiss_icp_localization/voxel_hash_map.hpp"
 
 namespace kiss_loc {
@@ -34,6 +35,14 @@ struct BevParams {
   double z_max = 0.30;       // ... and below this (drop overhead)
   bool subtract_map = true;  // drop points near the prior map (keep unmapped only)
   double map_dist = 0.3;     // a point within this of the prior map = mapped [m]
+  // Stage-2 subtraction: drop points that fall outside the track. The track is a
+  // 2D mask (TrackMask, GLIM map_track) of the drivable area; a point is dropped
+  // when its horizontal (in-plane) distance to the nearest track cell exceeds
+  // track_margin. This is the in-plane companion to the normal-direction z-band
+  // crop above, and removes objects sensed beyond the track where the prior map
+  // carries no information (the leading source of off-track false positives).
+  bool track_filter = false; // require points to lie on/near the track mask
+  double track_margin = 0.3; // max horizontal distance outside the track [m]
   // DBSCAN over occupied cells, independent of cell size `res`: eps is the
   // neighborhood radius and a cell needs >= min_samples occupied cells (incl.
   // itself) within eps to be a core. Sparse cells become noise and are dropped,
@@ -65,9 +74,12 @@ struct BevResult {
 
 class BevDetector {
 public:
-  // map: prior map for subtraction (may be null when subtract_map is false).
-  explicit BevDetector(const BevParams &p, const VoxelHashMap *map = nullptr)
-      : p_(p), map_(map) {}
+  // map: prior map for stage-1 subtraction (may be null when subtract_map off).
+  // track: 2D track mask for stage-2 subtraction (may be null when track_filter
+  // off, or invalid if the mask failed to load — filtering is then skipped).
+  explicit BevDetector(const BevParams &p, const VoxelHashMap *map = nullptr,
+                       const TrackMask *track = nullptr)
+      : p_(p), map_(map), track_(track) {}
 
   // points_map: deskewed scan already transformed into the map frame.
   // stamp: scan time [s] (monotonic), used for track velocity.
@@ -85,6 +97,7 @@ private:
 
   BevParams p_;
   const VoxelHashMap *map_ = nullptr;
+  const TrackMask *track_ = nullptr;
 
   struct Track {
     int id;
