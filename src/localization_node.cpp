@@ -73,7 +73,27 @@ public:
     publishMapCloud();
 
     if (detect_en_) {
-      detector_ = std::make_unique<BevDetector>(bev_params_, &map_);
+      const TrackMask *track = nullptr;
+      if (bev_params_.track_filter) {
+        std::string tp = track_map_path_;
+        if (tp.empty()) {
+          const auto slash = map_pcd_path_.find_last_of('/');
+          const std::string dir =
+              (slash == std::string::npos) ? "" : map_pcd_path_.substr(0, slash + 1);
+          tp = dir + "map_track.yaml";
+        }
+        if (track_mask_.Load(tp)) {
+          track = &track_mask_;
+          RCLCPP_INFO(get_logger(),
+                      "loaded track mask %s (stage-2 filter, margin %.2f m)",
+                      tp.c_str(), bev_params_.track_margin);
+        } else {
+          RCLCPP_WARN(get_logger(),
+                      "track mask %s failed to load — stage-2 track filter disabled",
+                      tp.c_str());
+        }
+      }
+      detector_ = std::make_unique<BevDetector>(bev_params_, &map_, track);
       obstacle_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
           "/kiss_loc/obstacles", 5);
       det_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -207,6 +227,11 @@ private:
     bp.track_gate = declare_parameter<double>("detect_track_gate", 1.0);
     bp.moving_speed = declare_parameter<double>("detect_moving_speed", 0.5);
     bp.max_misses = declare_parameter<int>("detect_max_misses", 5);
+    // stage-2 subtraction: reject detections outside the 2D track mask
+    // (GLIM map_track). Empty track_map_yaml -> <map dir>/map_track.yaml.
+    bp.track_filter = declare_parameter<bool>("detect_track_filter", false);
+    bp.track_margin = declare_parameter<double>("detect_track_margin", 0.3);
+    track_map_path_ = declare_parameter<std::string>("track_map_yaml", "");
     bev_params_ = bp;
     arrow_scale_ = declare_parameter<double>("detect_arrow_scale", 0.5);
   }
@@ -798,6 +823,8 @@ private:
   double crop_h_ = 0.0, crop_z_min_ = 0.05, crop_z_max_ = 0.30;
   bool detect_en_ = false;
   BevParams bev_params_;
+  std::string track_map_path_;
+  TrackMask track_mask_;
   double arrow_scale_ = 0.5;
 
   // map & estimation state

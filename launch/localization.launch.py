@@ -59,7 +59,10 @@ def launch_setup(context, *args, **kwargs):
     else:
         info.append(LogInfo(
             msg=f"[kiss_loc] no ground_lidar.yaml at {ground_yaml} -> using config crop params"))
-    params.append({"map_pcd_path": map_pcd})
+    # stage-2 detection filter: 2D track mask. Empty -> node uses
+    # <map_pcd dir>/map_track.yaml (GLIM output); skipped if the file is absent.
+    track_map = LaunchConfiguration("track_map").perform(context)
+    params.append({"map_pcd_path": map_pcd, "track_map_yaml": track_map})
 
     nodes = list(info) + [
         Node(
@@ -129,8 +132,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "map_pcd",
-                default_value="/home/leesh/ros2_ws/maps_glim/ifac_1/map.pcd",
-                description="Absolute path to the map PCD to load.",
+                default_value="/home/leesh/ros2_ws/maps_glim/test_2d/map_2p5d.pcd",
+                description="Absolute path to the map PCD to load (2.5d map).",
             ),
             DeclareLaunchArgument(
                 "show_2d_map",
@@ -147,6 +150,12 @@ def generate_launch_description():
                 default_value="",
                 description="Ground-crop param yaml. If empty, uses "
                 "<map_pcd dir>/ground_lidar.yaml (GLIM output); skipped if absent.",
+            ),
+            DeclareLaunchArgument(
+                "track_map",
+                default_value="",
+                description="2D track mask yaml for the stage-2 detection filter. "
+                "If empty, the node uses <map_pcd dir>/map_track.yaml (GLIM output).",
             ),
             DeclareLaunchArgument("use_rviz", default_value="false"),
             OpaqueFunction(function=launch_setup),

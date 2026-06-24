@@ -43,6 +43,18 @@ root는 `KISS_LOC_MAPS_ROOT` → `FASTLIVO_MAPS_ROOT` → 리포 내 stack_maste
 - **`AdaptiveThreshold`** — KISS-ICP 적응 임계: 모델(예측) 오차 RMS가 탐색 반경
 - **`LocalizationNode`** — IMU gyro만 사용 (가속도계 미사용): deskew 회전,
   스캔 간 예측 회전, IMU rate 전파. 병진은 constant-velocity 모델 + EMA
+- **`BevDetector`** — per-frame BEV 검출. z밴드 crop(법선방향) 후 **2단계 map
+  subtraction**: ① prior map(2.5d) 근접 점 제거 `GetClosestNeighbor` ② `TrackMask`
+  밖(법선수직/in-plane) 점 제거. DBSCAN 클러스터 + centroid 트래킹으로 moving 판정.
+- **`TrackMask`** (header-only) — GLIM `map_track.{pgm,yaml}`(점유격자 free 영역 =
+  주행 트랙) 로드 + Euclidean distance transform(2-pass) 사전계산. `DistOutsideTrack`
+  으로 track 밖 수평거리 반환(>margin이면 제거). 트랙 밖 오탐의 주 원인 차단.
+
+### GLIM 맵 산출물 (glim_map_pipeline.py)
+
+`map.pcd`(전체 3D) / `map_2p5d.pcd`(지면제거+z밴드 = localization·stage1이 로드) /
+`map_2d.*`(nav 점유격자) / `map_track.*`(2D 트랙마스크 = free 영역, stage2 필터용).
+트랙마스크는 **벽이 닫혀야** 레인만 잡힘(flood-fill) — 개방환경이면 밖으로 샘.
 
 ### 시간축 (중요)
 
