@@ -13,12 +13,14 @@ namespace kiss_loc {
 
 // 2D track mask (drivable area) loaded from a ROS-style occupancy yaml+pgm pair,
 // e.g. the GLIM pipeline's map_track.{yaml,pgm} where track pixels = 255 (the
-// flood-fill free region, sealed by walls). On load it precomputes a Euclidean
-// distance transform so DistOutsideTrack(x, y) returns, for a map-frame point,
-// 0 if the cell is inside the track and the horizontal distance [m] to the
-// nearest track cell otherwise (+inf if the point is off the grid). The BEV
-// detector uses it to reject objects that fall outside the track, where the
-// prior map carries no information.
+// flood-fill free region, sealed by walls). On load it precomputes a SIGNED
+// Euclidean distance field so SignedOutside(x, y) returns, for a map-frame point,
+// the horizontal distance [m] to the track boundary: negative inside the track
+// (magnitude = distance to the nearest wall/black cell), positive outside
+// (distance to the nearest track cell), +inf off the grid. The BEV detector
+// rejects a point when SignedOutside > track_margin, so a single signed margin
+// tunes the boundary: margin>0 dilates (keeps an outer ring, tolerant),
+// margin<0 erodes (drops a near-wall band inside the track, aggressive).
 class TrackMask {
 public:
   // Load from a map_server-style yaml (image / resolution / origin). Returns
@@ -66,18 +68,19 @@ public:
     return Valid();
   }
 
-  bool Valid() const { return W_ > 0 && H_ > 0 && !dist_.empty(); }
+  bool Valid() const { return W_ > 0 && H_ > 0 && !sdf_.empty(); }
 
-  // x, y in the map frame [m]; horizontal distance by which the point lies
-  // outside the track [m] (0 if inside; +inf if off the grid). With no mask
-  // loaded returns 0 so the caller's threshold keeps everything.
-  double DistOutsideTrack(double x, double y) const {
-    if (!Valid()) return 0.0;
+  // x, y in the map frame [m]; signed horizontal distance to the track boundary:
+  // negative inside the track (|.| = distance to nearest wall), positive outside
+  // (distance to nearest track cell), +inf off the grid. With no mask loaded
+  // returns -inf so the caller's threshold keeps everything.
+  double SignedOutside(double x, double y) const {
+    if (!Valid()) return -std::numeric_limits<double>::infinity();
     const int c = static_cast<int>(std::floor((x - ox_) / res_));
     const int r = static_cast<int>(std::floor((y - oy_) / res_));
     if (c < 0 || c >= W_ || r < 0 || r >= H_)
       return std::numeric_limits<double>::infinity();
-    return dist_[static_cast<size_t>(r) * W_ + c];
+    return sdf_[static_cast<size_t>(r) * W_ + c];
   }
 
 private:
@@ -148,39 +151,51 @@ private:
     }
   }
 
-  // Build dist_ (meters to nearest track cell) from the PGM pixels. dist_ is
-  // indexed [r*W + c] with r = 0 at the LOW world-y row (the pgm is stored
-  // top-to-bottom = high world-y first, so we flip on read-in).
+  // Build sdf_ (signed meters to the track boundary: <0 inside, >0 outside) from
+  // the PGM pixels. Indexed [r*W + c] with r = 0 at the LOW world-y row (the pgm
+  // is stored top-to-bottom = high world-y first, so we flip on read-in).
   void BuildDistance(const std::vector<uint8_t> &px) {
     const float INF = 1e20f;
-    std::vector<float> g(static_cast<size_t>(W_) * H_);
+    // world-y-up track mask
+    std::vector<uint8_t> track(static_cast<size_t>(W_) * H_);
     for (int r = 0; r < H_; ++r) {
-      const int src_row = H_ - 1 - r;  // flip to world y-up
-      for (int c = 0; c < W_; ++c) {
-        const bool track = px[static_cast<size_t>(src_row) * W_ + c] > 127;
-        g[static_cast<size_t>(r) * W_ + c] = track ? 0.0f : INF;
+      const int src_row = H_ - 1 - r;
+      for (int c = 0; c < W_; ++c)
+        track[static_cast<size_t>(r) * W_ + c] =
+            px[static_cast<size_t>(src_row) * W_ + c] > 127 ? 1 : 0;
+    }
+    // Euclidean distance [m] from every cell to the nearest seed cell.
+    auto edt = [&](bool seed_is_track) {
+      std::vector<float> g(static_cast<size_t>(W_) * H_);
+      for (size_t i = 0; i < g.size(); ++i) {
+        const bool seed = seed_is_track ? track[i] : !track[i];
+        g[i] = seed ? 0.0f : INF;
       }
-    }
-    // transform along columns, then rows
-    std::vector<float> col(H_), out, row(W_);
-    for (int c = 0; c < W_; ++c) {
-      for (int r = 0; r < H_; ++r) col[r] = g[static_cast<size_t>(r) * W_ + c];
-      DT1D(col, out);
-      for (int r = 0; r < H_; ++r) g[static_cast<size_t>(r) * W_ + c] = out[r];
-    }
-    for (int r = 0; r < H_; ++r) {
-      for (int c = 0; c < W_; ++c) row[c] = g[static_cast<size_t>(r) * W_ + c];
-      DT1D(row, out);
-      for (int c = 0; c < W_; ++c) g[static_cast<size_t>(r) * W_ + c] = out[c];
-    }
-    dist_.resize(g.size());
-    for (size_t i = 0; i < g.size(); ++i)
-      dist_[i] = std::sqrt(g[i]) * static_cast<float>(res_);
+      std::vector<float> col(H_), out, row(W_);
+      for (int c = 0; c < W_; ++c) {
+        for (int r = 0; r < H_; ++r) col[r] = g[static_cast<size_t>(r) * W_ + c];
+        DT1D(col, out);
+        for (int r = 0; r < H_; ++r) g[static_cast<size_t>(r) * W_ + c] = out[r];
+      }
+      for (int r = 0; r < H_; ++r) {
+        for (int c = 0; c < W_; ++c) row[c] = g[static_cast<size_t>(r) * W_ + c];
+        DT1D(row, out);
+        for (int c = 0; c < W_; ++c) g[static_cast<size_t>(r) * W_ + c] = out[c];
+      }
+      for (size_t i = 0; i < g.size(); ++i)
+        g[i] = std::sqrt(g[i]) * static_cast<float>(res_);
+      return g;
+    };
+    const std::vector<float> d_track = edt(true);   // 0 inside track, >0 outside
+    const std::vector<float> d_black = edt(false);  // 0 outside track, >0 inside
+    sdf_.resize(static_cast<size_t>(W_) * H_);
+    for (size_t i = 0; i < sdf_.size(); ++i)
+      sdf_[i] = d_track[i] - d_black[i];  // <0 inside (= -dist to wall), >0 outside
   }
 
   int W_ = 0, H_ = 0;
   double res_ = 0.05, ox_ = 0.0, oy_ = 0.0;
-  std::vector<float> dist_;  // [r*W + c], r=0 at low world-y, meters to track
+  std::vector<float> sdf_;  // [r*W + c], r=0 at low world-y, signed m to boundary
 };
 
 }  // namespace kiss_loc

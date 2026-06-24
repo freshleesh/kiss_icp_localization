@@ -6,24 +6,21 @@
 #include <vector>
 
 #include "kiss_icp_localization/track_mask.hpp"
-#include "kiss_icp_localization/voxel_hash_map.hpp"
 
 namespace kiss_loc {
 
 // Per-frame BEV obstacle detector. Using the localized (map-frame) scan it
-// removes the ground via the known map ground plane and crops to a vehicle-
-// height band. With map subtraction on (default), points close to the prior
-// map (walls / known structure) are dropped so only *unmapped* objects remain
-// — obstacles and the opponent; off, every cluster (walls included) is kept.
-// Survivors are projected to a 2D grid, clustered, and tracked across frames
-// so each gets a velocity / moving flag (moving => opponent).
+// removes the ground via the known map ground plane, crops to a vehicle-height
+// band, and drops points outside the track mask (drivable area). The survivors
+// are obstacles / the opponent on the track; they are projected to a 2D grid,
+// clustered, and tracked across frames so each gets a velocity / moving flag
+// (moving => opponent).
 //
 // Stateless per frame (no rolling background): nothing to warm up, no
 // leading-edge false positives as the platform drives into new area, and
 // insensitive to small pose jitter. Consumes the already-deskewed, already-
-// localized scan and the prior map, so it adds no registration. Map
-// subtraction has complete coverage (no leading-edge problem) and treats a
-// moved/new static object as an obstacle — which is the desired behavior.
+// localized scan, so it adds no registration. A moved/new static object on the
+// track is reported as an obstacle — the desired behavior.
 struct BevParams {
   double res = 0.2;          // BEV cell size [m]
   // Ground plane comes from ground_lidar.yaml (GLIM): the same sensor-frame
@@ -33,16 +30,13 @@ struct BevParams {
   // matches crop_z_min/crop_z_max from that yaml.
   double z_min = 0.05;       // keep points this far above ground [m] (ground removal)
   double z_max = 0.30;       // ... and below this (drop overhead)
-  bool subtract_map = true;  // drop points near the prior map (keep unmapped only)
-  double map_dist = 0.3;     // a point within this of the prior map = mapped [m]
-  // Stage-2 subtraction: drop points that fall outside the track. The track is a
-  // 2D mask (TrackMask, GLIM map_track) of the drivable area; a point is dropped
-  // when its horizontal (in-plane) distance to the nearest track cell exceeds
-  // track_margin. This is the in-plane companion to the normal-direction z-band
-  // crop above, and removes objects sensed beyond the track where the prior map
-  // carries no information (the leading source of off-track false positives).
+  // Track filter: drop points by signed distance to the track mask boundary
+  // (TrackMask, GLIM map_track of the drivable area). A point is dropped when
+  // SignedOutside(x,y) > track_margin. This is the in-plane companion to the
+  // normal-direction z-band crop above and is the only spatial filter: track
+  // inside = obstacle (kept), outside = wall / off-track (removed).
   bool track_filter = false; // require points to lie on/near the track mask
-  double track_margin = 0.3; // max horizontal distance outside the track [m]
+  double track_margin = 0.0; // signed: >0 dilate (tolerant), <0 erode (drop near-wall band) [m]
   // DBSCAN over occupied cells, independent of cell size `res`: eps is the
   // neighborhood radius and a cell needs >= min_samples occupied cells (incl.
   // itself) within eps to be a core. Sparse cells become noise and are dropped,
@@ -74,12 +68,10 @@ struct BevResult {
 
 class BevDetector {
 public:
-  // map: prior map for stage-1 subtraction (may be null when subtract_map off).
-  // track: 2D track mask for stage-2 subtraction (may be null when track_filter
-  // off, or invalid if the mask failed to load — filtering is then skipped).
-  explicit BevDetector(const BevParams &p, const VoxelHashMap *map = nullptr,
-                       const TrackMask *track = nullptr)
-      : p_(p), map_(map), track_(track) {}
+  // track: 2D track mask (may be null when track_filter off, or invalid if the
+  // mask failed to load — filtering is then skipped).
+  explicit BevDetector(const BevParams &p, const TrackMask *track = nullptr)
+      : p_(p), track_(track) {}
 
   // points_map: deskewed scan already transformed into the map frame.
   // stamp: scan time [s] (monotonic), used for track velocity.
@@ -96,7 +88,6 @@ private:
   }
 
   BevParams p_;
-  const VoxelHashMap *map_ = nullptr;
   const TrackMask *track_ = nullptr;
 
   struct Track {

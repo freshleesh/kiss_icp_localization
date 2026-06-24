@@ -24,21 +24,19 @@ BevResult BevDetector::Update(const std::vector<Eigen::Vector3d> &points_map,
   BevResult out;
   const double inv_res = 1.0 / p_.res;
 
-  const bool do_subtract = p_.subtract_map && map_ && !map_->Empty();
   const bool do_track = p_.track_filter && track_ && track_->Valid();
 
-  // ---- ground removal + height crop (+ 2-stage map subtraction), to 2D cells ----
+  // ---- ground removal + height crop + track filter, to 2D cells ----
   std::unordered_map<int64_t, Obs> cells;
   cells.reserve(points_map.size() / 4 + 16);
   out.obstacle_points.reserve(points_map.size() / 4 + 16);
-  MapPoint mp;
   for (const auto &p : points_map) {
     const double r = ground_normal.dot(p) + ground_offset;  // height above ground
     if (r < p_.z_min || r > p_.z_max) continue;  // ground / overhead removed
-    // stage 1: drop points that belong to the prior map (walls / known structure)
-    if (do_subtract && map_->GetClosestNeighbor(p, p_.map_dist, mp)) continue;
-    // stage 2: drop points whose in-plane position falls outside the track
-    if (do_track && track_->DistOutsideTrack(p.x(), p.y()) > p_.track_margin)
+    // drop points by signed distance to the track boundary. margin>0 keeps an
+    // outer ring (tolerant); margin<0 erodes a near-wall band (drops wall returns
+    // that scatter just inside the track).
+    if (do_track && track_->SignedOutside(p.x(), p.y()) > p_.track_margin)
       continue;
     const int ix = static_cast<int>(std::floor(p.x() * inv_res));
     const int iy = static_cast<int>(std::floor(p.y() * inv_res));

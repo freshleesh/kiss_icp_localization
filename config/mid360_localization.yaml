@@ -22,14 +22,11 @@
     localization_2d: false
 
     # ---- ground-band 기하 (지면 밴드) ----
-    # GLIM ground_lidar.yaml 절대경로 직접 지정. 노드가 이걸 읽어 아래 crop_* 를 덮어씀
-    # (파일 없으면 아래 기본값 폴백). 용도: (1) localization_2d=true 스캔 crop
-    # (2) detection z밴드  (3) /kiss_loc/scan_2d 밴드.
+    # GLIM ground_lidar.yaml 절대경로. 노드가 이걸 읽어 지면평면(crop_ground_normal/
+    # offset)과 z밴드(crop_z_min/max)의 단일 소스로 씀. localization_2d 또는 detection이
+    # 켜지면 필수 — 없으면 fatal(밴드 기하가 틀리므로). 튜닝(밴드 두께 등)도 여기서.
+    # 용도: (1) localization_2d=true 스캔 crop (2) detection z밴드 (3) /kiss_loc/scan_2d 밴드.
     ground_yaml: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/ground_lidar.yaml"
-    crop_ground_normal: [0.0, 0.0, 1.0]   # ground_yaml 폴백값. 센서프레임 지면 normal(위 방향)
-    crop_ground_offset: 0.0               # 라이다의 지면 위 높이 h = n_map·t_lidar + d
-    crop_z_min: 0.05            # 지면 위 남길 최저 높이 (m) — 맵 crop의 z_min과 동일하게
-    crop_z_max: 0.3             # 지면 위 남길 최고 높이 (m) — 맵 crop의 z_max와 동일하게
 
     # ---- input ----
     lidar_topic: "/livox/lidar"   # sensor_msgs/PointCloud2
@@ -73,10 +70,9 @@
     # ---- 2D occupancy grid (노드가 직접 발행, nav2_map_server 불필요) ----
     publish_2d_map: true        # 2D 래스터(pgm/yaml) 읽어 /map(OccupancyGrid) 직접 발행
     map_2d_topic: "/map"        # 발행 토픽 (transient_local)
-    # viz 소스: 빈 값이면 detection mask(track_map_yaml = 방금 설정한 2D png/yaml)를
-    # backdrop으로 사용. 그 다음 <active map 폴더>/map_2d.yaml. 채우면 그 yaml로 강제.
-    map_2d_yaml: ""
-    publish_tf: false           # TF는 발행 안 함 — pose는 odom_topic으로 발행
+    # viz backdrop 소스는 기본적으로 track_map_yaml(detection mask). 다른 yaml로 강제하려면
+    # map_2d_yaml 파라미터를 추가(절대경로) — 비우면 track_map → <active map 폴더>/map_2d.yaml 순.
+    publish_tf: true           # TF는 발행 안 함 — pose는 odom_topic으로 발행
     publish_aligned_scan: true
     # 2d화한 정합 스캔 = aligned 스캔의 지면밴드 슬랩(z 유지)을 map 프레임으로 발행.
     # localization_2d와 무관하게 항상 밴드를 계산(2D 모드면 이미 밴드라 그대로 통과).
@@ -95,16 +91,16 @@
     # 그대로 사용 — localization 입력 crop과 단일 소스. 센서프레임 평면을 매 프레임
     # 현재 pose로 map 프레임에 회전시켜 적용. 별도 detect_ground_*/detect_z_* 없음.
     # 검출 정의 = (지면밴드 위) ∧ (트랙 free영역 안). 장애물은 항상 맵과 무관하게
-    # 트랙 위 무작위로 생기므로, 트랙 필터(stage-2) 단독이 곧 이 정의. 벽은 트랙
-    # 밖이라 트랙 필터가 제거 → stage-1(prior map 근접 점 제거)은 이 시나리오에서
-    # 순수 중복 + 점당 NN 쿼리라 끔. 트랙마스크가 새는 개방맵일 때만 stage-1을 백업으로 켤 것.
-    detect_subtract_map: false    # stage-1 끔 (트랙 위 맵-내장 정적물이 없는 전제)
-    detect_map_dist: 0.2          # (stage-1 켤 때만) prior map 이 거리 이내면 '맵에 있음'으로 제거 (m)
-    # stage-2: GLIM map_track(점유격자 free 영역 = 주행 가능 트랙) 밖 검출 제거.
-    # 트랙 안=장애물(유지), 트랙 밖=벽/외곽(제거). 이제 detection의 유일한 공간 필터.
+    # 트랙 위 무작위로 생기므로, 트랙 필터가 곧 이 정의이자 유일한 공간 필터.
+    # (prior map 근접 점 제거 = 옛 stage-1은 이 시나리오에서 중복이라 코드에서 제거됨.)
+    # GLIM map_track(점유격자 free영역) 안=장애물(유지), 밖=벽/외곽(제거).
     # 법선방향 = 위 z밴드 crop, 법선수직(in-plane) = 이 트랙 거리 필터.
-    detect_track_filter: true     # track 마스크 밖 점 제거
-    detect_track_margin: 0.3      # 트랙 경계 밖 허용 수평거리 (m). 초과 시 제거
+    detect_track_filter: true     # track 마스크 기반 점 제거
+    # signed margin: SignedOutside(<0=트랙안, >0=트랙밖) > margin 이면 제거.
+    #   margin>0 = 경계 팽창(관대, 벽 누수↑) | margin<0 = 침식(벽 쪽 버퍼, 벽 빡세게 제거).
+    # 벽 점이 localization 흔들림·벽 두께로 트랙 안 몇 cm 튀어들어와도 침식이 흡수.
+    # -0.1 = 트랙 경계 안쪽 10cm까지 제거. 벽에 바싹 붙은 장애물 놓치면 -0.05로 완화.
+    detect_track_margin: -0.1
     # detection mask 2D png/yaml (map_server 스타일 yaml+pgm) 절대경로. stage-2 필터 +
     # /map viz backdrop 겸용. 비우면 <active map dir>/map_track.yaml 자동 사용.
     track_map_yaml: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_track.yaml"

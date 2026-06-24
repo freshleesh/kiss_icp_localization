@@ -97,12 +97,17 @@ public:
                       "loaded track mask %s (stage-2 filter, margin %.2f m)",
                       tp.c_str(), bev_params_.track_margin);
         } else {
-          RCLCPP_WARN(get_logger(),
-                      "track mask %s failed to load — stage-2 track filter disabled",
-                      tp.c_str());
+          // the track filter is the only spatial filter, so a missing mask =
+          // detection runs with no off-track rejection. Fail loudly rather than
+          // silently flood off-track false positives.
+          RCLCPP_FATAL(get_logger(),
+                       "track mask %s failed to load with detect_track_filter=true "
+                       "— fix track_map_yaml or set detect_track_filter:=false",
+                       tp.c_str());
+          throw std::runtime_error("track mask load failed");
         }
       }
-      detector_ = std::make_unique<BevDetector>(bev_params_, &map_, track);
+      detector_ = std::make_unique<BevDetector>(bev_params_, track);
       obstacle_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
           obstacle_topic_, 5);
       det_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -112,10 +117,10 @@ public:
       RCLCPP_INFO(get_logger(),
                   "BEV detection enabled: res %.2f m, height band [%.2f, %.2f] "
                   "above GLIM ground n=(%.4f,%.4f,%.4f) off=%.4f, "
-                  "map_subtract=%d (d=%.2f)",
+                  "track_filter=%d (margin %.2f)",
                   bev_params_.res, bev_params_.z_min, bev_params_.z_max,
                   crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_,
-                  bev_params_.subtract_map, bev_params_.map_dist);
+                  bev_params_.track_filter, bev_params_.track_margin);
     }
 
     const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
@@ -152,11 +157,9 @@ private:
   void declareParams() {
     // separate maps per mode: 3D=full cloud, 2D=band-cropped (2.5D) cloud. The
     // active one (selected below by localization_2d) is loaded for ICP and is the
-    // dir base for deriving the 2D raster (map_2d / map_track). map_pcd_path is a
-    // legacy single-path fallback used when the matching mode path is empty.
+    // dir base for deriving the 2D raster (map_2d / map_track).
     map_pcd_3d_ = declare_parameter<std::string>("map_pcd_3d", "");
     map_pcd_2d_ = declare_parameter<std::string>("map_pcd_2d", "");
-    map_pcd_legacy_ = declare_parameter<std::string>("map_pcd_path", "");
     map_voxel_size_ = declare_parameter<double>("map_voxel_size", 0.5);
     map_max_points_ = declare_parameter<int>("map_max_points_per_voxel", 30);
     // point-to-plane when the map PCD carries normals (fast_livo save_map does)
@@ -177,9 +180,18 @@ private:
     //   config (the old crop_ground_mode also sat in ground_lidar.yaml, which only
     //   carries the plane GEOMETRY below — normal/offset/z_min/z_max).
     localization_2d_ = declare_parameter<bool>("localization_2d", false);
-    // active map for ICP: 2D -> band (2.5D) map, 3D -> full map; legacy fallback.
+    // active map for ICP: 2D -> band (2.5D) map, 3D -> full map. Fail fast if the
+    // selected mode's map path is unset — no silent fallback to the other map,
+    // which would run a band-crop scan against a full map (or vice versa).
+    detect_en_ = declare_parameter<bool>("detect_en", false);  // needed by ground-yaml check
     map_pcd_path_ = localization_2d_ ? map_pcd_2d_ : map_pcd_3d_;
-    if (map_pcd_path_.empty()) map_pcd_path_ = map_pcd_legacy_;
+    if (map_pcd_path_.empty()) {
+      const char *which = localization_2d_ ? "map_pcd_2d (localization_2d=true)"
+                                           : "map_pcd_3d (localization_2d=false)";
+      RCLCPP_FATAL(get_logger(), "active map path is empty — set %s in the config",
+                   which);
+      throw std::runtime_error("active map path not set");
+    }
     auto cn = declare_parameter<std::vector<double>>("crop_ground_normal", {0.0, 0.0, 1.0});
     crop_n_ = (cn.size() == 3) ? Eigen::Vector3d(cn[0], cn[1], cn[2])
                                : Eigen::Vector3d(0.0, 0.0, 1.0);
@@ -251,7 +263,7 @@ private:
     scan_2d_topic_ = declare_parameter<std::string>("scan_2d_topic", "/kiss_loc/scan_2d");
 
     // ---- BEV object detection (unmapped statics + opponents) ----
-    detect_en_ = declare_parameter<bool>("detect_en", false);
+    // detect_en_ already declared above (ground-yaml fail-fast needs it).
     BevParams bp;
     bp.res = declare_parameter<double>("detect_res", 0.2);
     // ground removal + height crop reuse the GLIM ground plane and z-band from
@@ -260,8 +272,6 @@ private:
     // sensor frame; runDetection() rotates it into the map frame per pose.
     bp.z_min = crop_z_min_;
     bp.z_max = crop_z_max_;
-    bp.subtract_map = declare_parameter<bool>("detect_subtract_map", true);
-    bp.map_dist = declare_parameter<double>("detect_map_dist", 0.3);
     bp.eps = declare_parameter<double>("detect_eps", 0.2);
     bp.min_samples = declare_parameter<int>("detect_min_samples", 4);
     bp.min_cluster_cells = declare_parameter<int>("detect_min_cluster_cells", 2);
@@ -314,8 +324,21 @@ private:
     }
     std::ifstream f(path);
     if (!f) {
+      // The band geometry is wrong if the ground plane is missing (config default
+      // is the trivial identity plane). Fail fast when the path was set explicitly,
+      // or when 2D localization / detection actually needs the band. Only a plain
+      // 3D run with no detection may proceed on the config crop_* defaults.
+      const bool explicit_path = !ground_yaml_.empty();
+      const bool need_band = localization_2d_ || detect_en_;
+      if (explicit_path || need_band) {
+        RCLCPP_FATAL(get_logger(),
+                     "ground plane yaml not readable: %s (explicit=%d "
+                     "localization_2d=%d detect_en=%d) — the z-band crop needs it",
+                     path.c_str(), explicit_path, localization_2d_, detect_en_);
+        throw std::runtime_error("ground_lidar.yaml not loaded");
+      }
       RCLCPP_INFO(get_logger(),
-                  "no ground_lidar.yaml at %s -> using config crop params",
+                  "no ground_lidar.yaml at %s -> 3D run, config crop params",
                   path.c_str());
       return;
     }
@@ -991,9 +1014,9 @@ private:
     const BevResult res = detector_->Update(pts_map, t, n_map, h_map);
     const auto stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
 
-    // foreground cloud: points after ground removal + map subtraction only,
-    // i.e. the BEV detector's input *before* DBSCAN clustering / tracking
-    // (subtract_map on => walls dropped, unmapped objects + opponent kept)
+    // foreground cloud: points after ground removal + track filter, i.e. the
+    // BEV detector's input *before* DBSCAN clustering / tracking (on-track
+    // obstacles + opponent kept, off-track / walls removed)
     if (obstacle_pub_->get_subscription_count() > 0) {
       pcl::PointCloud<pcl::PointXYZ> oc;
       oc.reserve(res.obstacle_points.size());
@@ -1086,7 +1109,7 @@ private:
   // --------------------------- members ---------------------------
   // params
   std::string map_pcd_path_;  // active map (selected from 2d/3d by localization_2d)
-  std::string map_pcd_3d_, map_pcd_2d_, map_pcd_legacy_, ground_yaml_;
+  std::string map_pcd_3d_, map_pcd_2d_, ground_yaml_;
   std::string lidar_topic_, imu_topic_, map_frame_, base_frame_;
   double map_voxel_size_, scan_voxel_size_, min_range_, max_range_;
   int map_max_points_, point_filter_num_, max_iterations_, imu_init_samples_;
