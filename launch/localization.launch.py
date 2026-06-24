@@ -1,91 +1,32 @@
 """KISS-ICP map-based localization (MID360 + IMU).
 
 Usage:
-    ros2 launch kiss_icp_localization localization.launch.py \
-        map_pcd:=/abs/path/to/map.pcd
+    ros2 launch kiss_icp_localization localization.launch.py [use_rviz:=true]
 
-`map_pcd:=` is the absolute path to the map PCD and is loaded directly.
+All configuration is in config/mid360_localization.yaml — there are no map/path
+launch arguments. Set the absolute paths there:
+  - map_pcd_3d / map_pcd_2d : full vs band-cropped (2.5D) map; active one is
+    chosen by `localization_2d` (false=3D, true=2D).
+  - ground_yaml             : GLIM ground plane (crop_* geometry); the node reads
+    it directly and overrides the config crop_* defaults.
+  - track_map_yaml          : 2D detection mask (stage-2 filter + default /map viz).
+  - map_2d_yaml             : optional override of the /map viz source.
 
-If `<map_pcd dir>/ground_lidar.yaml` exists (written by glim_map_pipeline.py), its
-ground-crop params (crop_ground_mode/normal/offset, crop_z_min/max) are loaded
-automatically so the localization input scan is cropped to the same z-band as the
-map. Override the path with `ground_yaml:=`, or leave it absent to fall back to the
-config's crop params.
-
-The node publishes the 2D occupancy grid (<map_pcd dir>/map_2d.yaml, e.g. GLIM's
-map_2d.pgm) on /map itself as a lightweight RViz backdrop -- far cheaper to render
-than the full cloud. Override the yaml with map_2d:=/abs/path/to/foo.yaml.
+The only launch arg is use_rviz (spawns RViz with the bundled config).
 """
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (
-    DeclareLaunchArgument,
-    LogInfo,
-    OpaqueFunction,
-    SetEnvironmentVariable,
-)
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-def launch_setup(context, *args, **kwargs):
-    map_pcd = LaunchConfiguration("map_pcd").perform(context)
+def generate_launch_description():
     share = get_package_share_directory("kiss_icp_localization")
     config = os.path.join(share, "config", "mid360_localization.yaml")
-
-    # Auto-link the GLIM-derived ground crop: read ground_lidar.yaml from the
-    # map's own folder (override with ground_yaml:=). It carries crop_ground_mode
-    # + the LiDAR-frame ground plane (crop_ground_normal/offset, crop_z_min/max),
-    # so the localization input is cropped to the same band as the map. Later
-    # param files override earlier ones, so this wins over the config defaults.
-    ground_yaml = LaunchConfiguration("ground_yaml").perform(context)
-    if not ground_yaml:
-        ground_yaml = os.path.join(os.path.dirname(map_pcd), "ground_lidar.yaml")
-    params = [config]
-    info = []
-    if os.path.isfile(ground_yaml):
-        params.append(ground_yaml)
-        info.append(LogInfo(msg=f"[kiss_loc] ground crop auto-linked: {ground_yaml}"))
-    else:
-        info.append(LogInfo(
-            msg=f"[kiss_loc] no ground_lidar.yaml at {ground_yaml} -> using config crop params"))
-    # The node publishes the 2D OccupancyGrid on /map itself (config
-    # publish_2d_map: true). map_2d:= overrides the yaml it reads.
-    node_params = {"map_pcd_path": map_pcd}
-    map_2d_arg = LaunchConfiguration("map_2d").perform(context)
-    if map_2d_arg:
-        node_params["map_2d_yaml"] = map_2d_arg
-    # stage-2 detection filter: 2D track mask. Empty -> node uses
-    # <map_pcd dir>/map_track.yaml (GLIM output); skipped if the file is absent.
-    node_params["track_map_yaml"] = LaunchConfiguration("track_map").perform(context)
-    params.append(node_params)
-
-    nodes = list(info) + [
-        Node(
-            package="kiss_icp_localization",
-            executable="localization_node",
-            name="kiss_icp_localization",
-            output="screen",
-            parameters=params,
-            remappings=[("/kiss_loc/odometry", "/car_state/odom")],
-        )
-    ]
-
-    if LaunchConfiguration("use_rviz").perform(context).lower() == "true":
-        nodes.append(
-            Node(
-                package="rviz2",
-                executable="rviz2",
-                arguments=["-d", os.path.join(share, "config", "kiss_loc.rviz")],
-                output="log",
-            )
-        )
-    return nodes
-
-
-def generate_launch_description():
     return LaunchDescription(
         [
             # ICP's per-iteration parallel region is small; many cores hurt
@@ -93,30 +34,21 @@ def generate_launch_description():
             SetEnvironmentVariable(
                 "OMP_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "8")
             ),
-            DeclareLaunchArgument(
-                "map_pcd",
-                default_value="/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map.pcd",
-                description="Absolute path to the map PCD to load.",
-            ),
-            DeclareLaunchArgument(
-                "map_2d",
-                default_value="",
-                description="2D occupancy grid yaml the node publishes on /map. "
-                "If empty, uses <map_pcd dir>/map_2d.yaml.",
-            ),
-            DeclareLaunchArgument(
-                "ground_yaml",
-                default_value="",
-                description="Ground-crop param yaml. If empty, uses "
-                "<map_pcd dir>/ground_lidar.yaml (GLIM output); skipped if absent.",
-            ),
-            DeclareLaunchArgument(
-                "track_map",
-                default_value="",
-                description="2D track mask yaml for the stage-2 detection filter. "
-                "If empty, the node uses <map_pcd dir>/map_track.yaml (GLIM output).",
-            ),
             DeclareLaunchArgument("use_rviz", default_value="false"),
-            OpaqueFunction(function=launch_setup),
+            Node(
+                package="kiss_icp_localization",
+                executable="localization_node",
+                name="kiss_icp_localization",
+                output="screen",
+                parameters=[config],
+                remappings=[("/kiss_loc/odometry", "/car_state/odom")],
+            ),
+            Node(
+                package="rviz2",
+                executable="rviz2",
+                arguments=["-d", os.path.join(share, "config", "kiss_loc.rviz")],
+                output="log",
+                condition=IfCondition(LaunchConfiguration("use_rviz")),
+            ),
         ]
     )

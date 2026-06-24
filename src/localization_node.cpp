@@ -73,6 +73,9 @@ public:
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 50);
     aligned_pub_ =
         create_publisher<sensor_msgs::msg::PointCloud2>("/kiss_loc/scan_aligned", 5);
+    if (publish_2d_scan_)
+      scan_2d_pub_ =
+          create_publisher<sensor_msgs::msg::PointCloud2>(scan_2d_topic_, 5);
     map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         "/kiss_loc/map", rclcpp::QoS(1).transient_local());
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -87,13 +90,7 @@ public:
     if (detect_en_) {
       const TrackMask *track = nullptr;
       if (bev_params_.track_filter) {
-        std::string tp = track_map_path_;
-        if (tp.empty()) {
-          const auto slash = map_pcd_path_.find_last_of('/');
-          const std::string dir =
-              (slash == std::string::npos) ? "" : map_pcd_path_.substr(0, slash + 1);
-          tp = dir + "map_track.yaml";
-        }
+        const std::string tp = resolveTrackMapPath();
         if (track_mask_.Load(tp)) {
           track = &track_mask_;
           RCLCPP_INFO(get_logger(),
@@ -136,11 +133,13 @@ public:
                          msg) { onInitialPose(msg); });
     }
 
-    if (crop_mode_ == CropMode::kSensor)
+    if (localization_2d_)
       RCLCPP_INFO(get_logger(),
-                  "input ground-crop mode=sensor: keep height [%.2f, %.2f] m above "
+                  "localization=2D: band-crop scan to height [%.2f, %.2f] m above "
                   "plane n=(%.4f,%.4f,%.4f) off=%.4f (LiDAR frame)",
                   crop_z_min_, crop_z_max_, crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_);
+    else
+      RCLCPP_INFO(get_logger(), "localization=3D: full scan into ICP (no band crop)");
     RCLCPP_INFO(get_logger(),
                 "kiss_icp_localization ready: map %zu pts (voxel %.2f m), "
                 "lidar '%s' (PointCloud2), imu '%s' (imu_en=%d)",
@@ -151,7 +150,13 @@ public:
 private:
   // ----------------------------- setup -----------------------------
   void declareParams() {
-    map_pcd_path_ = declare_parameter<std::string>("map_pcd_path", "");
+    // separate maps per mode: 3D=full cloud, 2D=band-cropped (2.5D) cloud. The
+    // active one (selected below by localization_2d) is loaded for ICP and is the
+    // dir base for deriving the 2D raster (map_2d / map_track). map_pcd_path is a
+    // legacy single-path fallback used when the matching mode path is empty.
+    map_pcd_3d_ = declare_parameter<std::string>("map_pcd_3d", "");
+    map_pcd_2d_ = declare_parameter<std::string>("map_pcd_2d", "");
+    map_pcd_legacy_ = declare_parameter<std::string>("map_pcd_path", "");
     map_voxel_size_ = declare_parameter<double>("map_voxel_size", 0.5);
     map_max_points_ = declare_parameter<int>("map_max_points_per_voxel", 30);
     // point-to-plane when the map PCD carries normals (fast_livo save_map does)
@@ -161,15 +166,20 @@ private:
     max_range_ = declare_parameter<double>("max_range", 60.0);
     point_filter_num_ = declare_parameter<int>("point_filter_num", 1);
 
-    // ---- ground-band input crop ----
-    // mode "off"    : no crop (full scan, range-only).
-    // mode "sensor" : keep only points whose height above the ground plane is in
-    //   [crop_z_min, crop_z_max], so the scan matches a map cropped to the same
-    //   band. Plane is in the LiDAR frame — a constant LiDAR<->ground extrinsic
-    //   from GLIM (normal = R_map_lidar^T * n_map, offset = n_map.t_lidar + d).
-    //   height(p) = crop_n_.p + crop_h_.  Applied pre-deskew in keepPoint().
-    const std::string cmode = declare_parameter<std::string>("crop_ground_mode", "off");
-    crop_mode_ = (cmode == "sensor") ? CropMode::kSensor : CropMode::kOff;
+    // ---- 2D / 3D localization + ground-band geometry ----
+    // localization_2d=false (3D): no crop, full scan into ICP (range-only).
+    // localization_2d=true  (2D) : keep only points whose height above the ground
+    //   plane is in [crop_z_min, crop_z_max], so the scan matches a band-cropped
+    //   (2.5D) map for a consistent registration. The plane is in the LiDAR frame
+    //   — a constant LiDAR<->ground extrinsic from GLIM (normal = R_map_lidar^T *
+    //   n_map, offset = n_map.t_lidar + d); height(p) = crop_n_.p + crop_h_.
+    //   Applied pre-deskew in keepPoint(). This single bool lives only in the node
+    //   config (the old crop_ground_mode also sat in ground_lidar.yaml, which only
+    //   carries the plane GEOMETRY below — normal/offset/z_min/z_max).
+    localization_2d_ = declare_parameter<bool>("localization_2d", false);
+    // active map for ICP: 2D -> band (2.5D) map, 3D -> full map; legacy fallback.
+    map_pcd_path_ = localization_2d_ ? map_pcd_2d_ : map_pcd_3d_;
+    if (map_pcd_path_.empty()) map_pcd_path_ = map_pcd_legacy_;
     auto cn = declare_parameter<std::vector<double>>("crop_ground_normal", {0.0, 0.0, 1.0});
     crop_n_ = (cn.size() == 3) ? Eigen::Vector3d(cn[0], cn[1], cn[2])
                                : Eigen::Vector3d(0.0, 0.0, 1.0);
@@ -177,6 +187,12 @@ private:
     crop_h_ = declare_parameter<double>("crop_ground_offset", 0.0);
     crop_z_min_ = declare_parameter<double>("crop_z_min", 0.05);
     crop_z_max_ = declare_parameter<double>("crop_z_max", 0.30);
+    // GLIM ground plane: config-only auto-link from the active map folder (or an
+    // explicit ground_yaml). Overrides the four crop_* members above if present —
+    // replaces the launch param-file layering. Must run before the detection
+    // z-band (bp.z_min/z_max) is copied from crop_z_min_/max_ below.
+    ground_yaml_ = declare_parameter<std::string>("ground_yaml", "");
+    loadGroundYaml();
 
     lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/livox/lidar");
     imu_topic_ = declare_parameter<std::string>("imu_topic", "/livox/imu");
@@ -228,6 +244,11 @@ private:
     map_2d_yaml_ = declare_parameter<std::string>("map_2d_yaml", "");
     publish_tf_ = declare_parameter<bool>("publish_tf", true);
     publish_aligned_scan_ = declare_parameter<bool>("publish_aligned_scan", true);
+    // 2D-ized aligned scan: the ground-band slab (z kept) of the aligned scan in
+    // the map frame, for 2D consumers (costmap / scan matchers). Independent of
+    // localization_2d — the band is computed here regardless of the ICP input.
+    publish_2d_scan_ = declare_parameter<bool>("publish_2d_scan", true);
+    scan_2d_topic_ = declare_parameter<std::string>("scan_2d_topic", "/kiss_loc/scan_2d");
 
     // ---- BEV object detection (unmapped statics + opponents) ----
     detect_en_ = declare_parameter<bool>("detect_en", false);
@@ -266,10 +287,71 @@ private:
         declare_parameter<std::string>("detect_pose_topic", "/kiss_loc/obstacle_poses");
   }
 
+  // detection mask (= 2D track raster) yaml: explicit track_map_yaml, else
+  // <active map dir>/map_track.yaml. Used both for the BEV stage-2 filter and,
+  // by default, as the /map visualization backdrop (see load2DMap).
+  std::string resolveTrackMapPath() const {
+    if (!track_map_path_.empty()) return track_map_path_;
+    if (map_pcd_path_.empty()) return "";
+    const auto slash = map_pcd_path_.find_last_of('/');
+    const std::string dir =
+        (slash == std::string::npos) ? "" : map_pcd_path_.substr(0, slash + 1);
+    return dir + "map_track.yaml";
+  }
+
+  // GLIM ground plane auto-load (config-only; no launch param-file layering).
+  // Reads ground_yaml_ (or <active map dir>/ground_lidar.yaml) and overrides the
+  // crop_* geometry. It's a ROS param file but we only need four keys, so scan
+  // lines rather than pull in a yaml parser. crop_ground_mode (legacy) ignored.
+  void loadGroundYaml() {
+    std::string path = ground_yaml_;
+    if (path.empty()) {
+      if (map_pcd_path_.empty()) return;
+      const auto slash = map_pcd_path_.find_last_of('/');
+      const std::string dir =
+          (slash == std::string::npos) ? "" : map_pcd_path_.substr(0, slash + 1);
+      path = dir + "ground_lidar.yaml";
+    }
+    std::ifstream f(path);
+    if (!f) {
+      RCLCPP_INFO(get_logger(),
+                  "no ground_lidar.yaml at %s -> using config crop params",
+                  path.c_str());
+      return;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+      const auto hash = line.find('#');
+      if (hash != std::string::npos) line = line.substr(0, hash);
+      const auto colon = line.find(':');
+      if (colon == std::string::npos) continue;
+      std::string key = line.substr(0, colon), val = line.substr(colon + 1);
+      key.erase(std::remove_if(key.begin(), key.end(), ::isspace), key.end());
+      if (key == "crop_ground_normal") {
+        for (char &c : val)
+          if (c == '[' || c == ']' || c == ',') c = ' ';
+        std::istringstream iss(val);
+        double a, b, c;
+        if (iss >> a >> b >> c) {
+          crop_n_ = Eigen::Vector3d(a, b, c);
+          if (crop_n_.norm() > 1e-9) crop_n_.normalize();
+        }
+      } else if (key == "crop_ground_offset") {
+        crop_h_ = std::atof(val.c_str());
+      } else if (key == "crop_z_min") {
+        crop_z_min_ = std::atof(val.c_str());
+      } else if (key == "crop_z_max") {
+        crop_z_max_ = std::atof(val.c_str());
+      }
+    }
+    RCLCPP_INFO(get_logger(), "ground crop auto-linked from %s", path.c_str());
+  }
+
   void loadMap() {
     if (map_pcd_path_.empty()) {
-      RCLCPP_FATAL(get_logger(), "map_pcd_path parameter is empty");
-      throw std::runtime_error("map_pcd_path not set");
+      RCLCPP_FATAL(get_logger(), "active map PCD path is empty (set map_pcd_3d / "
+                                 "map_pcd_2d for the selected localization_2d mode)");
+      throw std::runtime_error("map pcd path not set");
     }
     pcl::PointCloud<pcl::PointNormal> cloud;  // missing normal fields load as 0
     if (pcl::io::loadPCDFile<pcl::PointNormal>(map_pcd_path_, cloud) < 0) {
@@ -340,7 +422,10 @@ private:
   // Self-contained (no nav2_map_server / yaml-cpp). Returns false on any
   // missing/unreadable file so the node just skips /map publishing.
   bool load2DMap() {
+    // viz backdrop source: explicit map_2d_yaml override, else the detection
+    // mask (track map) just configured, else <active map dir>/map_2d.yaml.
     std::string yaml_path = map_2d_yaml_;
+    if (yaml_path.empty()) yaml_path = resolveTrackMapPath();
     if (yaml_path.empty()) {
       if (map_pcd_path_.empty()) return false;
       const auto slash = map_pcd_path_.find_last_of('/');
@@ -545,7 +630,7 @@ private:
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
     const double r2 = double(x) * x + double(y) * y + double(z) * z;
     if (r2 <= min_range_ * min_range_ || r2 >= max_range_ * max_range_) return false;
-    if (crop_mode_ == CropMode::kSensor) {
+    if (localization_2d_) {
       const double hgt = crop_n_.x() * x + crop_n_.y() * y + crop_n_.z() * z + crop_h_;
       if (hgt < crop_z_min_ || hgt > crop_z_max_) return false;
     }
@@ -794,6 +879,8 @@ private:
 
     publishOdom(T_, scan.t_end);
     if (publish_aligned_scan_) publishAligned(ds, scan.t_end);
+    if (publish_2d_scan_ && scan_2d_pub_->get_subscription_count() > 0)
+      publishBand2D(ds, scan.t_end);
 
     // detection runs only on a confident, locked fix — a mislocalized pose
     // would paint the whole scan as foreground. The divergence-coast path
@@ -861,6 +948,26 @@ private:
     msg.header.frame_id = map_frame_;
     msg.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
     aligned_pub_->publish(msg);
+  }
+
+  // 2D-ized aligned scan: the ground-band slab of `pts` (sensor frame) in the
+  // map frame, z preserved. Same z-band as detection (crop_z_min/max above the
+  // GLIM ground plane). Runs regardless of localization_2d; in 2D mode `pts` is
+  // already band-cropped so the test just passes everything through.
+  void publishBand2D(const std::vector<Eigen::Vector3d> &pts, double t) {
+    pcl::PointCloud<pcl::PointXYZ> cloud;
+    cloud.reserve(pts.size());
+    for (const auto &p : pts) {
+      const double hgt = crop_n_.dot(p) + crop_h_;  // height above ground (sensor frame)
+      if (hgt < crop_z_min_ || hgt > crop_z_max_) continue;
+      const Eigen::Vector3d pw = T_ * p;
+      cloud.emplace_back(pw.x(), pw.y(), pw.z());
+    }
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(cloud, msg);
+    msg.header.frame_id = map_frame_;
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
+    scan_2d_pub_->publish(msg);
   }
 
   // --------------------------- detection ---------------------------
@@ -978,7 +1085,9 @@ private:
 
   // --------------------------- members ---------------------------
   // params
-  std::string map_pcd_path_, lidar_topic_, imu_topic_, map_frame_, base_frame_;
+  std::string map_pcd_path_;  // active map (selected from 2d/3d by localization_2d)
+  std::string map_pcd_3d_, map_pcd_2d_, map_pcd_legacy_, ground_yaml_;
+  std::string lidar_topic_, imu_topic_, map_frame_, base_frame_;
   double map_voxel_size_, scan_voxel_size_, min_range_, max_range_;
   int map_max_points_, point_filter_num_, max_iterations_, imu_init_samples_;
   double convergence_eps_, initial_threshold_, min_threshold_, min_motion_;
@@ -991,9 +1100,8 @@ private:
       use_normals_;
   std::vector<double> initial_pose_;
   Eigen::Matrix3d R_il_ = Eigen::Matrix3d::Identity();
-  // ground-band input crop
-  enum class CropMode { kOff, kSensor };
-  CropMode crop_mode_ = CropMode::kOff;
+  // 2D localization (band-crop scan for ICP) + ground-band plane geometry
+  bool localization_2d_ = false;
   Eigen::Vector3d crop_n_ = Eigen::Vector3d::UnitZ();
   double crop_h_ = 0.0, crop_z_min_ = 0.05, crop_z_max_ = 0.30;
   bool detect_en_ = false;
@@ -1030,6 +1138,9 @@ private:
   // ros interfaces
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_pub_, map_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr scan_2d_pub_;
+  bool publish_2d_scan_ = true;
+  std::string scan_2d_topic_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc2_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
