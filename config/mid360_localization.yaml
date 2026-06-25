@@ -1,13 +1,12 @@
 /**:
   ros__parameters:
-    # ---- map (절대경로 직접 지정; launch 인자 안 씀) ----
-    # 3D(localization_2d=false): map_pcd_3d(full) 를 복셀맵으로 ICP — 필수.
-    # 2D(localization_2d=true) : 정합은 track_map_yaml SDF 에 scan-to-SDF — PCD는 매칭에
-    #   안 씀. map_pcd_2d 는 선택값(/kiss_loc/map viz + 형제 yaml 디렉토리 앵커)이라 비워도 됨.
-    map_pcd_3d: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map.pcd"
-    # map_pcd_3d: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_track_left.pcd"
-
-    map_pcd_2d: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_2p5d.pcd"
+    # ---- map ----
+    # 보통은 launch 인자 `map:=<name>` 하나로 충분: 노드가 maps_root 아래
+    #   <maps_root>/<map>/<map>{.pcd, .yaml, _track.yaml, _ground_lidar.yaml}
+    # 를 자동 도출(3D=.pcd, 2D=.yaml SDF + _track.yaml 검출마스크, 공통=_ground_lidar.yaml).
+    # 아래 개별 경로는 **명시 시 도출값을 오버라이드**하는 용도 — 평소엔 비워둠.
+    map_pcd_3d: ""              # 3D voxel ICP용 (비우면 <map>.pcd)
+    map_pcd_2d: ""             # 새 스킴에선 미사용(2D는 SDF 매칭). 오버라이드용
     map_voxel_size: 0.5         # 맵 복셀 해시 셀 크기 (m) — 대응점 탐색 반경도 이에 비례
     map_max_points_per_voxel: 30
     use_normals: true           # point-to-plane 정합. PCD normal이 0이면 (fast_livo save_map이 그럼)
@@ -26,9 +25,9 @@
     #   불필요. 모드 결정은 오직 이 config 한 곳
     #   — 옛 crop_ground_mode는 ground_lidar.yaml에도 있어 양쪽 수정해야 했음.
     localization_2d: true
-    # 2D 정합 전용 SDF 맵 (map_server 스타일 yaml+pgm; >127=주행영역, 경계=벽).
-    # detection용 track_map_yaml과 분리 — 비우면 track_map_yaml로 폴백.
-    loc_2d_map_yaml: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_2d.yaml"
+    # 2D 정합 전용 SDF 맵 (map_server 스타일 yaml; image가 png여도 형제 pgm로 폴백 로드).
+    # 비우면 `map`에서 <map>.yaml 도출, 그래도 없으면 track_map_yaml로 폴백.
+    loc_2d_map_yaml: ""
     # 2D scan-to-SDF complementary 필터 게인: 매 스캔 SDF 보정의 적용 비율(1=원본 fix 그대로,
     # 낮을수록 부드러움 — gyro가 고주파 운동 담당, SDF는 저주파 드리프트만 천천히 보정).
     # 소수 점+이산 SDF의 프레임간 yaw/xy 진동 억제. 0.3 권장(bag서 진동 ~절반↓), 0.15↓는 lag로 역효과.
@@ -36,11 +35,11 @@
     loc_2d_corr_gain: 0.3
 
     # ---- ground-band 기하 (지면 밴드) ----
-    # GLIM ground_lidar.yaml 절대경로. 노드가 이걸 읽어 지면평면(crop_ground_normal/
-    # offset)과 z밴드(crop_z_min/max)의 단일 소스로 씀. localization_2d 또는 detection이
-    # 켜지면 필수 — 없으면 fatal(밴드 기하가 틀리므로). 튜닝(밴드 두께 등)도 여기서.
-    # 용도: (1) localization_2d=true 스캔 crop (2) detection z밴드 (3) /kiss_loc/scan_2d 밴드.
-    ground_yaml: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/ground_lidar.yaml"
+    # 노드가 이걸 읽어 지면평면(crop_ground_normal/offset)과 z밴드(crop_z_min/max)의
+    # 단일 소스로 씀. 비우면 `map`에서 <map>_ground_lidar.yaml 도출. localization_2d
+    # (PointCloud2) 또는 detection이 켜지면 필수 — 없으면 fatal. (input_mode=2d LaserScan은
+    # 밴드 crop 자체를 건너뛰어 불필요.) 튜닝(밴드 두께 등)도 여기서/맵 yaml에서.
+    ground_yaml: ""
 
     # ---- input ----
     lidar_topic: "/livox/lidar"   # sensor_msgs/PointCloud2
@@ -116,9 +115,9 @@
     # 벽 점이 localization 흔들림·벽 두께로 트랙 안 몇 cm 튀어들어와도 침식이 흡수.
     # -0.1 = 트랙 경계 안쪽 10cm까지 제거. 벽에 바싹 붙은 장애물 놓치면 -0.05로 완화.
     detect_track_margin: -0.2
-    # detection mask 2D png/yaml (map_server 스타일 yaml+pgm) 절대경로. stage-2 필터 +
-    # /map viz backdrop 겸용. 비우면 <active map dir>/map_track.yaml 자동 사용.
-    track_map_yaml: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_track.yaml"
+    # detection mask 2D png/yaml (map_server 스타일; image png여도 형제 pgm 폴백).
+    # 비우면 `map`에서 <map>_track.yaml 도출. stage-2 검출 필터용.
+    track_map_yaml: ""
     # DBSCAN (밀도 기반). res 그리드를 공간 인덱스로 사용.
     detect_eps: 0.3               # 이웃 반경 (m). res와 독립. 비용 ∝ (eps/res)²
     detect_min_samples: 2         # eps 안에 (자기 포함) 이만큼 셀이 있어야 core. 클수록 노이즈 제거↑
