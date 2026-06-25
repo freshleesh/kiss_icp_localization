@@ -57,7 +57,15 @@ public:
     if (slash != std::string::npos) dir = yaml_path.substr(0, slash + 1);
     std::vector<uint8_t> px;
     int w = 0, h = 0;
-    if (!ReadPGM(dir + image, px, w, h)) return false;
+    if (!ReadPGM(dir + image, px, w, h)) {
+      // map_server yamls frequently reference a .png/.bmp (e.g. cartographer
+      // output) while a sibling .pgm exists. Our reader is PGM-only (no image
+      // codec dependency), so fall back to the same basename with a .pgm ext.
+      const auto dot = image.find_last_of('.');
+      const std::string pgm =
+          (dot == std::string::npos ? image : image.substr(0, dot)) + ".pgm";
+      if (pgm == image || !ReadPGM(dir + pgm, px, w, h)) return false;
+    }
 
     res_ = res;
     ox_ = ox;

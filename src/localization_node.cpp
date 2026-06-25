@@ -34,6 +34,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -139,12 +140,23 @@ public:
     }
 
     const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
-    pc2_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        lidar_topic_, sensor_qos,
-        [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { onPC2(msg); });
+    if (input_scan_) {
+      scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+          scan_topic_, sensor_qos,
+          [this](const sensor_msgs::msg::LaserScan::SharedPtr msg) { onScan(msg); });
+    } else {
+      pc2_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+          lidar_topic_, sensor_qos,
+          [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { onPC2(msg); });
+    }
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
         imu_topic_, sensor_qos,
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) { onImu(msg); });
+    if (use_odom_twist_) {
+      odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+          odom_twist_topic_, rclcpp::SensorDataQoS().keep_last(20),
+          [this](const nav_msgs::msg::Odometry::SharedPtr msg) { onOdom(msg); });
+    }
     if (use_initial_pose_topic_) {
       initpose_sub_ =
           create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -153,7 +165,11 @@ public:
                          msg) { onInitialPose(msg); });
     }
 
-    if (localization_2d_)
+    if (localization_2d_ && input_scan_)
+      RCLCPP_INFO(get_logger(),
+                  "localization=2D (LaserScan input): no band-crop, scan-to-SDF "
+                  "match (3-DoF x,y,yaw) against track mask");
+    else if (localization_2d_)
       RCLCPP_INFO(get_logger(),
                   "localization=2D: band-crop scan to height [%.2f, %.2f] m above "
                   "plane n=(%.4f,%.4f,%.4f) off=%.4f, then scan-to-SDF match "
@@ -163,9 +179,12 @@ public:
       RCLCPP_INFO(get_logger(), "localization=3D: full scan into ICP (no band crop)");
     RCLCPP_INFO(get_logger(),
                 "kiss_icp_localization ready: map %zu pts (voxel %.2f m), "
-                "lidar '%s' (PointCloud2), imu '%s' (imu_en=%d)",
-                map_.NumPoints(), map_voxel_size_, lidar_topic_.c_str(),
-                imu_topic_.c_str(), imu_en_);
+                "input %s '%s', imu '%s' (imu_en=%d), odom_twist '%s'",
+                map_.NumPoints(), map_voxel_size_,
+                input_scan_ ? "LaserScan" : "PointCloud2",
+                input_scan_ ? scan_topic_.c_str() : lidar_topic_.c_str(),
+                imu_topic_.c_str(), imu_en_,
+                use_odom_twist_ ? odom_twist_topic_.c_str() : "(none, CV)");
   }
 
 private:
@@ -196,6 +215,15 @@ private:
     //   config (the old crop_ground_mode also sat in ground_lidar.yaml, which only
     //   carries the plane GEOMETRY below — normal/offset/z_min/z_max).
     localization_2d_ = declare_parameter<bool>("localization_2d", false);
+    // input front-end: "3d"=PointCloud2 (default, current behaviour) | "2d"/"scan"
+    // = subscribe a sensor_msgs/LaserScan directly. A 2D scan has no 3D structure
+    // to ICP, so it FORCES scan-to-SDF matching (localization_2d) and the vertical
+    // band-crop / ground-plane geometry are skipped — the points are already on
+    // the sensor's 2D plane (z=0). Declared here (before the map/ground-yaml
+    // fail-fasts below) so they can branch on it.
+    input_mode_ = declare_parameter<std::string>("input_mode", "3d");
+    input_scan_ = (input_mode_ == "2d" || input_mode_ == "scan");
+    if (input_scan_) localization_2d_ = true;
     // 3D: full-cloud voxel map for ICP — required. 2D: registration is scan-to-SDF
     // against the track mask (see AlignScanToTrackSdf), so the PCD is NOT used for
     // matching; map_pcd_2d is optional and only serves as the /kiss_loc/map viz +
@@ -224,6 +252,13 @@ private:
 
     lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/livox/lidar");
     imu_topic_ = declare_parameter<std::string>("imu_topic", "/livox/imu");
+    // 2D-input (input_mode=2d) LaserScan topic.
+    scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
+    // Wheel-odometry topic whose twist drives the TRANSLATION prediction (gyro
+    // drives rotation). Empty -> translation falls back to the ICP-derived
+    // constant-velocity estimate. Set "/vesc/odom" on the unicorn car.
+    odom_twist_topic_ = declare_parameter<std::string>("odom_twist_topic", "");
+    use_odom_twist_ = !odom_twist_topic_.empty();
     // livox driver with use_system_timestamp stamps the header with now() at
     // publish time, i.e. at the END of the 100 ms accumulation window
     stamp_at_scan_end_ = declare_parameter<bool>("stamp_at_scan_end", true);
@@ -351,7 +386,9 @@ private:
       // or when 2D localization / detection actually needs the band. Only a plain
       // 3D run with no detection may proceed on the config crop_* defaults.
       const bool explicit_path = !ground_yaml_.empty();
-      const bool need_band = localization_2d_ || detect_en_;
+      // scan-input 2D needs no band geometry (points are already 2D); only a
+      // PointCloud2-fed 2D crop or detection requires the ground plane.
+      const bool need_band = (localization_2d_ && !input_scan_) || detect_en_;
       if (explicit_path || need_band) {
         RCLCPP_FATAL(get_logger(),
                      "ground plane yaml not readable: %s (explicit=%d "
@@ -683,6 +720,42 @@ private:
     enqueueScan(std::move(scan));
   }
 
+  // 2D-input front-end: a planar LaserScan -> (x, y, 0) points in the sensor
+  // frame. No vertical band-crop (already 2D); range-gated only. time_increment
+  // (if the driver sets it) gives per-point times so gyro deskew still applies.
+  void onScan(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+    PendingScan scan;
+    scan.t_begin = rclcpp::Time(msg->header.stamp).seconds();
+    const size_t n = msg->ranges.size();
+    scan.points.reserve(n);
+    const bool has_time = msg->time_increment > 0.0f;
+    float max_rel = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+      const float r = msg->ranges[i];
+      if (!std::isfinite(r) || r < msg->range_min || r > msg->range_max) continue;
+      if (r < min_range_ || r > max_range_) continue;
+      const float a = msg->angle_min + static_cast<float>(i) * msg->angle_increment;
+      scan.points.emplace_back(r * std::cos(a), r * std::sin(a), 0.0);
+      if (has_time) {
+        const float rt = static_cast<float>(i) * msg->time_increment;
+        scan.rel_time.push_back(rt);
+        max_rel = std::max(max_rel, rt);
+      }
+    }
+    finalizeScanTimes(scan, max_rel);
+    enqueueScan(std::move(scan));
+  }
+
+  // Wheel odometry: its body twist drives the TRANSLATION prediction (gyro keeps
+  // rotation). Overwrites v_body_ directly; the ICP-derived velocity update in
+  // processScan is skipped when use_odom_twist_ is set. Single-threaded executor
+  // serialises this with processScan/onImu, so the shared v_body_ needs no lock.
+  void onOdom(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    v_body_.x() = msg->twist.twist.linear.x;
+    v_body_.y() = msg->twist.twist.linear.y;  // ~0 on a car
+    v_body_.z() = 0.0;
+  }
+
   bool keepPoint(float x, float y, float z) const {
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
     const double r2 = double(x) * x + double(y) * y + double(z) * z;
@@ -939,7 +1012,7 @@ private:
     // accel/speed limits: in corridor-degenerate stretches ICP can't observe
     // the along-track direction, and an unbounded velocity estimate feeds
     // back into the prediction and runs away
-    if (!reanchored && dt > 0.0 && dt < 0.5) {
+    if (!use_odom_twist_ && !reanchored && dt > 0.0 && dt < 0.5) {
       const Eigen::Vector3d v_new = result.pose.rotation().transpose() *
                                     (result.pose.translation() - T_.translation()) / dt;
       Eigen::Vector3d dv = (1.0 - vel_smoothing_) * (v_new - v_body_);
@@ -1214,6 +1287,9 @@ private:
   std::string map_pcd_path_;  // active map (selected from 2d/3d by localization_2d)
   std::string map_pcd_3d_, map_pcd_2d_, ground_yaml_;
   std::string lidar_topic_, imu_topic_, map_frame_, base_frame_;
+  // 2D LaserScan input front-end + wheel-odom translation source
+  std::string input_mode_, scan_topic_, odom_twist_topic_;
+  bool input_scan_ = false, use_odom_twist_ = false;
   double map_voxel_size_, scan_voxel_size_, min_range_, max_range_;
   int map_max_points_, point_filter_num_, max_iterations_, imu_init_samples_;
   double convergence_eps_, initial_threshold_, min_threshold_, min_motion_;
@@ -1273,7 +1349,9 @@ private:
   bool publish_2d_scan_ = true;
   std::string scan_2d_topic_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc2_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
       initpose_sub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
