@@ -35,6 +35,7 @@ def generate_launch_description():
                 "OMP_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "8")
             ),
             DeclareLaunchArgument("use_rviz", default_value="false"),
+            DeclareLaunchArgument("use_lap_manager", default_value="true"),
             Node(
                 package="kiss_icp_localization",
                 executable="localization_node",
@@ -42,6 +43,15 @@ def generate_launch_description():
                 output="screen",
                 parameters=[config],
                 remappings=[("/kiss_loc/odometry", "/car_state/odom")],
+            ),
+            # Lap timing + colored trajectory. Reset/started by RViz "2D Pose
+            # Estimate" (/initialpose); tracks /car_state/odom. See stack_master.
+            Node(
+                package="stack_master",
+                executable="lap_manager_node.py",
+                name="lap_manager",
+                output="screen",
+                condition=IfCondition(LaunchConfiguration("use_lap_manager")),
             ),
             Node(
                 package="rviz2",

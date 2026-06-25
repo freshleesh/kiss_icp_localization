@@ -83,6 +83,35 @@ public:
     return sdf_[static_cast<size_t>(r) * W_ + c];
   }
 
+  // Bilinearly-interpolated signed distance `val` [m] and its in-plane gradient
+  // (gx, gy) = dSDF/d(x,y) [m/m, dimensionless] at map-frame (x, y). The stored
+  // sdf_ samples are treated as cell *centers* (world x = ox_ + (c+0.5)*res_).
+  // Returns false when the 2x2 interpolation stencil falls off the grid (so the
+  // caller drops that point from the 2D scan-to-SDF fit). (gx, gy) is the true
+  // gradient of the signed field: it points toward INCREASING signed distance,
+  // i.e. outward across the nearest wall (from deep-inside, through the wall, to
+  // outside). Magnitude ~1 near a wall.
+  bool ValueGrad(double x, double y, double &val, double &gx, double &gy) const {
+    if (!Valid()) return false;
+    const double fx = (x - ox_) / res_ - 0.5;
+    const double fy = (y - oy_) / res_ - 0.5;
+    const int c0 = static_cast<int>(std::floor(fx));
+    const int r0 = static_cast<int>(std::floor(fy));
+    if (c0 < 0 || c0 + 1 >= W_ || r0 < 0 || r0 + 1 >= H_) return false;
+    const double tx = fx - c0;
+    const double ty = fy - r0;
+    const double v00 = sdf_[static_cast<size_t>(r0) * W_ + c0];
+    const double v10 = sdf_[static_cast<size_t>(r0) * W_ + (c0 + 1)];
+    const double v01 = sdf_[static_cast<size_t>(r0 + 1) * W_ + c0];
+    const double v11 = sdf_[static_cast<size_t>(r0 + 1) * W_ + (c0 + 1)];
+    val = (1 - tx) * (1 - ty) * v00 + tx * (1 - ty) * v10 +
+          (1 - tx) * ty * v01 + tx * ty * v11;
+    // gradient of the bilinear patch (chain rule through the cell->world scale)
+    gx = ((1 - ty) * (v10 - v00) + ty * (v11 - v01)) / res_;
+    gy = ((1 - tx) * (v01 - v00) + tx * (v11 - v10)) / res_;
+    return true;
+  }
+
 private:
   // P5 (binary) PGM reader. Stores rows top-to-bottom as written on disk.
   static bool ReadPGM(const std::string &path, std::vector<uint8_t> &px, int &w,

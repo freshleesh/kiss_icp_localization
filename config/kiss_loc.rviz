@@ -31,6 +31,26 @@ Visualization Manager:
       Size (Pixels): 3
       Color Transformer: FlatColor
       Color: 255; 60; 60
+    # ---- 2D localization view: track raster backdrop + flattened scan ----
+    - Class: rviz_default_plugins/Map
+      Name: TrackMap2D
+      Enabled: true
+      Topic:
+        Value: /map
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color Scheme: map
+      Alpha: 0.7
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Scan2D
+      Enabled: true
+      Topic:
+        Value: /kiss_loc/scan_2d
+        Reliability Policy: Best Effort
+      Style: Points
+      Size (Pixels): 4
+      Color Transformer: FlatColor
+      Color: 60; 255; 120
     - Class: rviz_default_plugins/Odometry
       Name: Odometry
       Enabled: true
@@ -57,14 +77,22 @@ Visualization Manager:
         Value: /initialpose
   Views:
     Current:
-      Class: rviz_default_plugins/Orbit
-      Distance: 40
-      Pitch: 1.2
-      Yaw: 0
-      Focal Point:
-        X: 8
-        Y: 8
-        Z: 0
+      # top-down orthographic so the flattened scan_2d overlays the /map raster 1:1
+      Class: rviz_default_plugins/TopDownOrtho
+      Scale: 25
+      X: 8
+      Y: 8
+      Angle: 0
+    Saved:
+      - Class: rviz_default_plugins/Orbit
+        Name: Orbit3D
+        Distance: 40
+        Pitch: 1.2
+        Yaw: 0
+        Focal Point:
+          X: 8
+          Y: 8
+          Z: 0
 Window Geometry:
   Height: 900
   Width: 1400

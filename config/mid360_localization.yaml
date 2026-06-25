@@ -1,8 +1,12 @@
 /**:
   ros__parameters:
     # ---- map (절대경로 직접 지정; launch 인자 안 씀) ----
-    # localization_2d 에 따라 active 맵 선택: false→map_pcd_3d(full), true→map_pcd_2d(2.5d).
+    # 3D(localization_2d=false): map_pcd_3d(full) 를 복셀맵으로 ICP — 필수.
+    # 2D(localization_2d=true) : 정합은 track_map_yaml SDF 에 scan-to-SDF — PCD는 매칭에
+    #   안 씀. map_pcd_2d 는 선택값(/kiss_loc/map viz + 형제 yaml 디렉토리 앵커)이라 비워도 됨.
     map_pcd_3d: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map.pcd"
+    # map_pcd_3d: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_track_left.pcd"
+
     map_pcd_2d: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_2p5d.pcd"
     map_voxel_size: 0.5         # 맵 복셀 해시 셀 크기 (m) — 대응점 탐색 반경도 이에 비례
     map_max_points_per_voxel: 30
@@ -16,10 +20,20 @@
     point_filter_num: 1         # N점 중 1점 사용 (1=전부)
 
     # ---- 2D / 3D localization ----
-    # false(3D) = 전체 스캔으로 ICP | true(2D) = 스캔을 아래 지면밴드로 crop 후 ICP
-    #   (맵도 밴드맵 map_2p5d 여야 정합 일관). 모드 결정은 오직 이 config 한 곳
+    # false(3D) = 전체 스캔으로 복셀맵 point-to-plane ICP
+    # true(2D)  = 스캔을 아래 지면밴드로 crop → 2D로 평탄화 → loc_2d_map_yaml SDF에
+    #   scan-to-SDF 정합(3-DoF x,y,yaw; z/roll/pitch는 마운트 틸트로 고정). map_2p5d.pcd
+    #   불필요. 모드 결정은 오직 이 config 한 곳
     #   — 옛 crop_ground_mode는 ground_lidar.yaml에도 있어 양쪽 수정해야 했음.
-    localization_2d: false
+    localization_2d: true
+    # 2D 정합 전용 SDF 맵 (map_server 스타일 yaml+pgm; >127=주행영역, 경계=벽).
+    # detection용 track_map_yaml과 분리 — 비우면 track_map_yaml로 폴백.
+    loc_2d_map_yaml: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_2d.yaml"
+    # 2D scan-to-SDF complementary 필터 게인: 매 스캔 SDF 보정의 적용 비율(1=원본 fix 그대로,
+    # 낮을수록 부드러움 — gyro가 고주파 운동 담당, SDF는 저주파 드리프트만 천천히 보정).
+    # 소수 점+이산 SDF의 프레임간 yaw/xy 진동 억제. 0.3 권장(bag서 진동 ~절반↓), 0.15↓는 lag로 역효과.
+    # 트레이드오프: 낮출수록 드리프트 보정이 느려짐(약간 lag) — 공격적 제어면 0.4~0.5로.
+    loc_2d_corr_gain: 0.3
 
     # ---- ground-band 기하 (지면 밴드) ----
     # GLIM ground_lidar.yaml 절대경로. 노드가 이걸 읽어 지면평면(crop_ground_normal/
@@ -72,11 +86,12 @@
     map_2d_topic: "/map"        # 발행 토픽 (transient_local)
     # viz backdrop 소스는 기본적으로 track_map_yaml(detection mask). 다른 yaml로 강제하려면
     # map_2d_yaml 파라미터를 추가(절대경로) — 비우면 track_map → <active map 폴더>/map_2d.yaml 순.
-    publish_tf: true           # TF는 발행 안 함 — pose는 odom_topic으로 발행
+    publish_tf: false           # TF는 발행 안 함 — pose는 odom_topic으로 발행
     publish_aligned_scan: true
-    # 2d화한 정합 스캔 = aligned 스캔의 지면밴드 슬랩(z 유지)을 map 프레임으로 발행.
-    # localization_2d와 무관하게 항상 밴드를 계산(2D 모드면 이미 밴드라 그대로 통과).
-    # 구독자 있을 때만 발행. 2D costmap/scan 소비자용.
+    # 2d화한 정합 스캔 = aligned 스캔의 지면밴드 슬랩을 map 프레임으로 옮기고 z=0으로
+    # 평탄화해 발행 — 2D scan-to-SDF가 매칭하는 평면(x,y)·/map 트랙래스터(z=0)와 정확히
+    # 겹침. localization_2d와 무관하게 항상 밴드 계산(2D 모드면 이미 밴드라 통과).
+    # 구독자 있을 때만 발행. 2D costmap/scan·2D 정합 viz 소비자용.
     publish_2d_scan: true
     scan_2d_topic: "/kiss_loc/scan_2d"
 
@@ -100,7 +115,7 @@
     #   margin>0 = 경계 팽창(관대, 벽 누수↑) | margin<0 = 침식(벽 쪽 버퍼, 벽 빡세게 제거).
     # 벽 점이 localization 흔들림·벽 두께로 트랙 안 몇 cm 튀어들어와도 침식이 흡수.
     # -0.1 = 트랙 경계 안쪽 10cm까지 제거. 벽에 바싹 붙은 장애물 놓치면 -0.05로 완화.
-    detect_track_margin: -0.1
+    detect_track_margin: -0.2
     # detection mask 2D png/yaml (map_server 스타일 yaml+pgm) 절대경로. stage-2 필터 +
     # /map viz backdrop 겸용. 비우면 <active map dir>/map_track.yaml 자동 사용.
     track_map_yaml: "/Users/mini/ros2_ws/src/IFAC2026/src/system/stack_master/maps/ifac_1/map_track.yaml"

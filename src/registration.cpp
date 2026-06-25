@@ -121,4 +121,91 @@ RegistrationResult AlignScanToMap(const std::vector<Eigen::Vector3d> &scan,
   return result;
 }
 
+RegistrationResult AlignScanToTrackSdf(const std::vector<Eigen::Vector3d> &scan,
+                                       const TrackMask &track,
+                                       const Eigen::Isometry3d &initial_guess,
+                                       double max_corr_dist, double kernel_sigma,
+                                       int max_iterations,
+                                       double convergence_eps) {
+  RegistrationResult result;
+  result.pose = initial_guess;
+  if (scan.empty() || !track.Valid()) return result;
+
+  const double kernel2 = kernel_sigma * kernel_sigma;
+  Eigen::Isometry3d T = initial_guess;
+
+  for (int iter = 0; iter < max_iterations; ++iter) {
+    // planar normal equations in (dx, dy, dyaw)
+    Eigen::Matrix3d JTJ = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d JTr = Eigen::Vector3d::Zero();
+    int n = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(std::min(8, omp_get_max_threads()))
+    {
+      Eigen::Matrix3d JTJ_p = Eigen::Matrix3d::Zero();
+      Eigen::Vector3d JTr_p = Eigen::Vector3d::Zero();
+      int n_p = 0;
+#pragma omp for nowait
+      for (size_t i = 0; i < scan.size(); ++i) {
+        const Eigen::Vector3d pw = T * scan[i];
+        double val, gx, gy;
+        if (!track.ValueGrad(pw.x(), pw.y(), val, gx, gy)) continue;
+        if (std::abs(val) > max_corr_dist) continue;
+        // residual r = SDF; J = dr/d(dx,dy,dyaw), with d(px,py)/dyaw = (-py, px)
+        const Eigen::Vector3d J(gx, gy, gx * (-pw.y()) + gy * pw.x());
+        const double w =
+            kernel2 * kernel2 / ((kernel2 + val * val) * (kernel2 + val * val));
+        JTJ_p.noalias() += J * (w * J.transpose());
+        JTr_p.noalias() += J * (w * val);
+        ++n_p;
+      }
+#pragma omp critical
+      {
+        JTJ += JTJ_p;
+        JTr += JTr_p;
+        n += n_p;
+      }
+    }
+#else
+    for (const auto &p : scan) {
+      const Eigen::Vector3d pw = T * p;
+      double val, gx, gy;
+      if (!track.ValueGrad(pw.x(), pw.y(), val, gx, gy)) continue;
+      if (std::abs(val) > max_corr_dist) continue;
+      const Eigen::Vector3d J(gx, gy, gx * (-pw.y()) + gy * pw.x());
+      const double w =
+          kernel2 * kernel2 / ((kernel2 + val * val) * (kernel2 + val * val));
+      JTJ.noalias() += J * (w * J.transpose());
+      JTr.noalias() += J * (w * val);
+      ++n;
+    }
+#endif
+
+    result.iterations = iter + 1;
+    result.num_correspondences = n;
+    if (n < 10) break;
+
+    JTJ.diagonal().array() += 1e-6;  // ridge: bound along-track-degenerate frames
+    Eigen::Vector3d dx = JTJ.ldlt().solve(-JTr);
+    if (!dx.allFinite()) break;
+    const double step = dx.head<2>().norm();  // clamp runaway translation
+    if (step > 1.0) dx *= 1.0 / step;
+
+    // apply planar increment in the map frame (z, and the bulk of roll/pitch,
+    // are preserved: a z-rotation leaves the translation's z untouched)
+    const Eigen::Matrix3d Rz(Eigen::AngleAxisd(dx.z(), Eigen::Vector3d::UnitZ()));
+    T.linear() = Rz * T.linear();
+    T.translation() = Rz * T.translation() + Eigen::Vector3d(dx.x(), dx.y(), 0.0);
+
+    if (dx.norm() < convergence_eps) {
+      result.converged = true;
+      break;
+    }
+  }
+
+  result.pose = T;
+  return result;
+}
+
 }  // namespace kiss_loc

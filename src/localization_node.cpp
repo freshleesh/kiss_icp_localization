@@ -87,26 +87,41 @@ public:
       if (load2DMap()) publish2DMap();
     }
 
-    if (detect_en_) {
-      const TrackMask *track = nullptr;
-      if (bev_params_.track_filter) {
-        const std::string tp = resolveTrackMapPath();
-        if (track_mask_.Load(tp)) {
-          track = &track_mask_;
-          RCLCPP_INFO(get_logger(),
-                      "loaded track mask %s (stage-2 filter, margin %.2f m)",
-                      tp.c_str(), bev_params_.track_margin);
-        } else {
-          // the track filter is the only spatial filter, so a missing mask =
-          // detection runs with no off-track rejection. Fail loudly rather than
-          // silently flood off-track false positives.
-          RCLCPP_FATAL(get_logger(),
-                       "track mask %s failed to load with detect_track_filter=true "
-                       "— fix track_map_yaml or set detect_track_filter:=false",
-                       tp.c_str());
-          throw std::runtime_error("track mask load failed");
-        }
+    // 2D localization SDF map (scan-to-SDF target): its own yaml so the matching
+    // map can differ from the detection track mask. Empty loc_2d_map_yaml falls
+    // back to the track map. A missing map is fatal — in 2D mode it IS the map.
+    if (localization_2d_) {
+      const std::string lp =
+          loc_map_path_.empty() ? resolveTrackMapPath() : loc_map_path_;
+      if (!loc_mask_.Load(lp)) {
+        RCLCPP_FATAL(get_logger(),
+                     "2D localization map %s failed to load — set loc_2d_map_yaml "
+                     "(or track_map_yaml as fallback)",
+                     lp.c_str());
+        throw std::runtime_error("2D localization map load failed");
       }
+      RCLCPP_INFO(get_logger(), "loaded 2D localization SDF map %s%s", lp.c_str(),
+                  loc_map_path_.empty() ? " (fallback: track map)" : "");
+    }
+
+    // Detection stage-2 off-track filter uses the track mask. A missing mask is
+    // fatal because it's the only spatial filter (silent off-track false pos).
+    if (detect_en_ && bev_params_.track_filter) {
+      const std::string tp = resolveTrackMapPath();
+      if (!track_mask_.Load(tp)) {
+        RCLCPP_FATAL(get_logger(),
+                     "track mask %s failed to load with detect_track_filter=true "
+                     "— fix track_map_yaml or set detect_track_filter:=false",
+                     tp.c_str());
+        throw std::runtime_error("track mask load failed");
+      }
+      RCLCPP_INFO(get_logger(), "loaded detection track mask %s (margin %.2f m)",
+                  tp.c_str(), bev_params_.track_margin);
+    }
+
+    if (detect_en_) {
+      const TrackMask *track =
+          (bev_params_.track_filter && track_mask_.Valid()) ? &track_mask_ : nullptr;
       detector_ = std::make_unique<BevDetector>(bev_params_, track);
       obstacle_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
           obstacle_topic_, 5);
@@ -141,7 +156,8 @@ public:
     if (localization_2d_)
       RCLCPP_INFO(get_logger(),
                   "localization=2D: band-crop scan to height [%.2f, %.2f] m above "
-                  "plane n=(%.4f,%.4f,%.4f) off=%.4f (LiDAR frame)",
+                  "plane n=(%.4f,%.4f,%.4f) off=%.4f, then scan-to-SDF match "
+                  "(3-DoF x,y,yaw) against track mask",
                   crop_z_min_, crop_z_max_, crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_);
     else
       RCLCPP_INFO(get_logger(), "localization=3D: full scan into ICP (no band crop)");
@@ -180,16 +196,16 @@ private:
     //   config (the old crop_ground_mode also sat in ground_lidar.yaml, which only
     //   carries the plane GEOMETRY below — normal/offset/z_min/z_max).
     localization_2d_ = declare_parameter<bool>("localization_2d", false);
-    // active map for ICP: 2D -> band (2.5D) map, 3D -> full map. Fail fast if the
-    // selected mode's map path is unset — no silent fallback to the other map,
-    // which would run a band-crop scan against a full map (or vice versa).
+    // 3D: full-cloud voxel map for ICP — required. 2D: registration is scan-to-SDF
+    // against the track mask (see AlignScanToTrackSdf), so the PCD is NOT used for
+    // matching; map_pcd_2d is optional and only serves as the /kiss_loc/map viz +
+    // the dir anchor for deriving sibling yamls. track_map_yaml is what's required
+    // in 2D (enforced when the track mask is loaded below).
     detect_en_ = declare_parameter<bool>("detect_en", false);  // needed by ground-yaml check
     map_pcd_path_ = localization_2d_ ? map_pcd_2d_ : map_pcd_3d_;
-    if (map_pcd_path_.empty()) {
-      const char *which = localization_2d_ ? "map_pcd_2d (localization_2d=true)"
-                                           : "map_pcd_3d (localization_2d=false)";
-      RCLCPP_FATAL(get_logger(), "active map path is empty — set %s in the config",
-                   which);
+    if (map_pcd_path_.empty() && !localization_2d_) {
+      RCLCPP_FATAL(get_logger(),
+                   "map_pcd_3d is empty — set it in the config (localization_2d=false)");
       throw std::runtime_error("active map path not set");
     }
     auto cn = declare_parameter<std::vector<double>>("crop_ground_normal", {0.0, 0.0, 1.0});
@@ -235,6 +251,10 @@ private:
     // robustness margin, keep it at sensor max range like upstream KISS-ICP
     adaptive_range_ = declare_parameter<double>("adaptive_range", 60.0);
     vel_smoothing_ = declare_parameter<double>("vel_smoothing", 0.3);
+    // 2D scan-to-SDF complementary-filter gain: fraction of the SDF fix applied
+    // per scan (1=full/raw, lower=smoother, gyro carries fast motion). Cuts the
+    // per-scan yaw/xy jitter inherent to a few-point discretized-SDF fit.
+    corr_gain_ = declare_parameter<double>("loc_2d_corr_gain", 1.0);
     reject_trans_ = declare_parameter<double>("reject_trans", 2.0);
     reject_rot_deg_ = declare_parameter<double>("reject_rot_deg", 30.0);
     reject_recover_count_ = declare_parameter<int>("reject_recover_count", 3);
@@ -283,6 +303,8 @@ private:
     bp.track_filter = declare_parameter<bool>("detect_track_filter", false);
     bp.track_margin = declare_parameter<double>("detect_track_margin", 0.3);
     track_map_path_ = declare_parameter<std::string>("track_map_yaml", "");
+    // dedicated 2D-localization SDF map (yaml+pgm); empty -> fall back to track map
+    loc_map_path_ = declare_parameter<std::string>("loc_2d_map_yaml", "");
     bev_params_ = bp;
     arrow_scale_ = declare_parameter<double>("detect_arrow_scale", 0.5);
     // output topics (yaml-configurable): foreground/obstacle cloud + detection
@@ -372,9 +394,11 @@ private:
 
   void loadMap() {
     if (map_pcd_path_.empty()) {
-      RCLCPP_FATAL(get_logger(), "active map PCD path is empty (set map_pcd_3d / "
-                                 "map_pcd_2d for the selected localization_2d mode)");
-      throw std::runtime_error("map pcd path not set");
+      // only reachable in 2D mode (3D fails earlier) — scan-to-SDF needs no PCD;
+      // skip the voxel map and the /kiss_loc/map cloud viz.
+      RCLCPP_INFO(get_logger(),
+                  "no map PCD (localization_2d, scan-to-SDF) — voxel map skipped");
+      return;
     }
     pcl::PointCloud<pcl::PointNormal> cloud;  // missing normal fields load as 0
     if (pcl::io::loadPCDFile<pcl::PointNormal>(map_pcd_path_, cloud) < 0) {
@@ -393,11 +417,14 @@ private:
       if (normals.back().allFinite() && normals.back().norm() > 0.5)
         ++n_valid_normals;
     }
+    // 2D mode loads the PCD only for the /kiss_loc/map backdrop — it is not the
+    // ICP target (scan-to-SDF is), so build point-only and skip normal PCA.
+    const bool want_normals = use_normals_ && !localization_2d_;
     const bool normals_ok =
-        use_normals_ && n_valid_normals > pts.size() / 2;
+        want_normals && n_valid_normals > pts.size() / 2;
     map_ = VoxelHashMap(map_voxel_size_, map_max_points_);
     map_.Build(pts, normals_ok ? normals : std::vector<Eigen::Vector3d>{});
-    if (use_normals_ && !map_.HasNormals()) {
+    if (want_normals && !map_.HasNormals()) {
       // fast_livo save_map writes zero normals — estimate per-voxel by PCA
       const auto t0 = std::chrono::steady_clock::now();
       map_.EstimateNormals();
@@ -424,6 +451,13 @@ private:
            Eigen::AngleAxisd(initial_pose_[3], Eigen::Vector3d::UnitX()))
               .toRotationMatrix();
     }
+    // 2D mode pins the pose to this z and fixes roll/pitch to the LiDAR mount
+    // tilt: R_level_ levels the ground normal (crop_n_, from ground_lidar.yaml)
+    // onto the map vertical, so the planar attitude is Rz(yaw) * R_level_.
+    plane_z_ = T_.translation().z();
+    R_level_ = Eigen::Quaterniond::FromTwoVectors(crop_n_, Eigen::Vector3d::UnitZ())
+                   .toRotationMatrix();
+    if (localization_2d_) T_ = planarize(T_);
     T_prop_ = T_;
   }
 
@@ -708,6 +742,10 @@ private:
     T.linear() = Eigen::Quaterniond(q.w, q.x, q.y, q.z).toRotationMatrix();
     // RViz 2D Pose Estimate has z = 0; keep current z to stay on the map floor
     if (have_first_fix_) T.translation().z() = T_.translation().z();
+    if (localization_2d_) {
+      plane_z_ = T.translation().z();  // re-anchor the plane height
+      T = planarize(T);
+    }
     T_ = T;
     T_prop_ = T;
     v_body_.setZero();
@@ -842,9 +880,18 @@ private:
     const double prep_ms = ms_since(t_start);
     const auto t_icp = std::chrono::steady_clock::now();
     const double th = adaptive_->ComputeThreshold();
-    const auto result = AlignScanToMap(ds, map_, T_pred, th, th / 3.0,
-                                       max_iterations_, convergence_eps_,
-                                       use_normals_);
+    // 2D: flatten the band slab onto the track-mask SDF (3-DoF x,y,yaw);
+    // 3D: full robust point-to-plane ICP against the voxel map.
+    auto result =
+        localization_2d_
+            ? AlignScanToTrackSdf(ds, loc_mask_, T_pred, th, th / 3.0,
+                                  max_iterations_, convergence_eps_)
+            : AlignScanToMap(ds, map_, T_pred, th, th / 3.0, max_iterations_,
+                             convergence_eps_, use_normals_);
+    // 2D: SDF observes only (x,y,yaw) — pin z, drop roll/pitch so the unobserved
+    // axes can't dead-reckon the pose off the ground plane (and so the next
+    // prediction's forward velocity stays in-plane instead of leaking into z).
+    if (localization_2d_) result.pose = planarize(result.pose);
     const double icp_ms = ms_since(t_icp);
 
     // 5) divergence gate — an isolated fix jumping away from the prediction
@@ -862,7 +909,7 @@ private:
                     "coasting on prediction (%d consecutive)",
                     dev_t, dev_r * 180.0 / M_PI, result.num_correspondences,
                     consecutive_rejects_);
-        T_ = T_pred;
+        T_ = localization_2d_ ? planarize(T_pred) : T_pred;
         last_scan_end_ = scan.t_end;
         T_prop_ = T_;
         t_prop_ = scan.t_end;
@@ -879,6 +926,14 @@ private:
     }
     consecutive_rejects_ = 0;
     if (!reanchored) adaptive_->UpdateModelDeviation(dev);
+
+    // 2D complementary low-pass: blend the (noisy) SDF fix toward the smooth
+    // gyro/CV prediction to suppress per-scan yaw/xy chatter. Done after the
+    // divergence gate (which must see the raw fix) and skipped on re-anchor
+    // (there we want the full jump). Velocity below is then derived from the
+    // smoothed pose, so the high-rate propagation between scans is smooth too.
+    if (localization_2d_ && corr_gain_ < 1.0 && !reanchored)
+      result.pose = blendPlanar(T_pred, result.pose, corr_gain_);
 
     // 6) state update — velocity from consecutive fixes, with physical
     // accel/speed limits: in corridor-degenerate stretches ICP can't observe
@@ -929,7 +984,53 @@ private:
   }
 
   // --------------------------- publishing ---------------------------
-  void publishOdom(const Eigen::Isometry3d &T, double t) {
+  // Project a pose onto the 2D-mode planar manifold: keep (x, y), pin z to
+  // plane_z_, and set the attitude to Rz(yaw) * R_level_ — only yaw is free,
+  // roll/pitch are FIXED to the LiDAR mount tilt. R_level_ levels the ground
+  // normal (crop_n_ from ground_lidar.yaml) onto the map vertical, so a band
+  // point projects as Rz(yaw)*(R_level_*p): leveled first, then yawed → correct
+  // horizontal (x,y) for the SDF. The SDF observes none of z/roll/pitch; left
+  // free they dead-reckon away (the pose floated ~+20 m of z over 60 s), and
+  // pinning roll/pitch to 0 instead of the real tilt would mis-project the
+  // tilted scan (a 0.25 m band at 15° smears walls ~6 cm).
+  // extract the planar yaw of a pose, undoing the fixed mount tilt R_level_
+  double planarYaw(const Eigen::Isometry3d &T) const {
+    const Eigen::Matrix3d Ryaw = T.linear() * R_level_.transpose();
+    return std::atan2(Ryaw(1, 0), Ryaw(0, 0));
+  }
+
+  // build a planar pose (x, y, plane_z_) with attitude Rz(yaw) * R_level_
+  Eigen::Isometry3d fromPlanar(double x, double y, double yaw) const {
+    Eigen::Isometry3d P = Eigen::Isometry3d::Identity();
+    P.linear() =
+        Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix() * R_level_;
+    P.translation() = Eigen::Vector3d(x, y, plane_z_);
+    return P;
+  }
+
+  Eigen::Isometry3d planarize(const Eigen::Isometry3d &T) const {
+    return fromPlanar(T.translation().x(), T.translation().y(), planarYaw(T));
+  }
+
+  // Complementary low-pass for 2D mode: move a fraction `gain` from the smooth
+  // gyro/CV prediction `pred` toward the noisy SDF fix `meas`. gain=1 takes the
+  // fix outright (jittery); gain<1 lets the gyro carry the fast motion and only
+  // slowly applies the absolute (drift) correction, killing per-scan yaw/xy
+  // chatter. Not velocity damping (that adds prediction lag and worsens jitter)
+  // — it low-passes only the absolute pose, so dynamic motion stays responsive.
+  Eigen::Isometry3d blendPlanar(const Eigen::Isometry3d &pred,
+                                const Eigen::Isometry3d &meas, double gain) const {
+    const double xp = pred.translation().x(), yp = pred.translation().y();
+    const double xm = meas.translation().x(), ym = meas.translation().y();
+    const double yp_ = planarYaw(pred);
+    const double dyaw = std::remainder(planarYaw(meas) - yp_, 2.0 * M_PI);
+    return fromPlanar(xp + gain * (xm - xp), yp + gain * (ym - yp),
+                      yp_ + gain * dyaw);
+  }
+
+  void publishOdom(const Eigen::Isometry3d &T_in, double t) {
+    // 2D mode: never publish a floating/off-plane pose (z/roll/pitch unobserved)
+    const Eigen::Isometry3d T = localization_2d_ ? planarize(T_in) : T_in;
     nav_msgs::msg::Odometry odom;
     odom.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
     odom.header.frame_id = map_frame_;
@@ -973,10 +1074,12 @@ private:
     aligned_pub_->publish(msg);
   }
 
-  // 2D-ized aligned scan: the ground-band slab of `pts` (sensor frame) in the
-  // map frame, z preserved. Same z-band as detection (crop_z_min/max above the
-  // GLIM ground plane). Runs regardless of localization_2d; in 2D mode `pts` is
-  // already band-cropped so the test just passes everything through.
+  // 2D-ized aligned scan: the ground-band slab of `pts` (sensor frame) projected
+  // into the map frame and FLATTENED to z=0 — the same planar (x,y) view the 2D
+  // scan-to-SDF registration matches against, and the plane the /map track raster
+  // (OccupancyGrid at z=0) is drawn on, so the two overlay exactly in RViz. Same
+  // z-band as detection (crop_z_min/max above the GLIM ground plane). Runs
+  // regardless of localization_2d; in 2D mode `pts` is already band-cropped.
   void publishBand2D(const std::vector<Eigen::Vector3d> &pts, double t) {
     pcl::PointCloud<pcl::PointXYZ> cloud;
     cloud.reserve(pts.size());
@@ -984,7 +1087,7 @@ private:
       const double hgt = crop_n_.dot(p) + crop_h_;  // height above ground (sensor frame)
       if (hgt < crop_z_min_ || hgt > crop_z_max_) continue;
       const Eigen::Vector3d pw = T_ * p;
-      cloud.emplace_back(pw.x(), pw.y(), pw.z());
+      cloud.emplace_back(pw.x(), pw.y(), 0.0);  // flatten onto the map ground plane
     }
     sensor_msgs::msg::PointCloud2 msg;
     pcl::toROSMsg(cloud, msg);
@@ -1136,7 +1239,9 @@ private:
   bool grid_ready_ = false;
   BevParams bev_params_;
   std::string track_map_path_;
-  TrackMask track_mask_;
+  TrackMask track_mask_;       // detection stage-2 off-track filter
+  std::string loc_map_path_;   // 2D-localization SDF map yaml (empty -> track map)
+  TrackMask loc_mask_;         // 2D scan-to-SDF registration target
   double arrow_scale_ = 0.5;
 
   // map & estimation state
@@ -1146,6 +1251,9 @@ private:
   Eigen::Isometry3d T_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d T_prop_ = Eigen::Isometry3d::Identity();
   Eigen::Vector3d v_body_ = Eigen::Vector3d::Zero();
+  double plane_z_ = 0.0;  // 2D-mode ground-plane height the pose is pinned to
+  Eigen::Matrix3d R_level_ = Eigen::Matrix3d::Identity();  // 2D: levels crop_n_ -> map z
+  double corr_gain_ = 1.0;  // 2D scan-to-SDF complementary-filter gain (1=raw fix)
   double last_scan_end_ = -1.0;
   double t_prop_ = -1.0;
   bool have_first_fix_ = false;
