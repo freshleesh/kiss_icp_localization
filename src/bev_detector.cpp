@@ -33,10 +33,10 @@ BevResult BevDetector::Update(const std::vector<Eigen::Vector3d> &points_map,
   for (const auto &p : points_map) {
     const double r = ground_normal.dot(p) + ground_offset;  // height above ground
     if (r < p_.z_min || r > p_.z_max) continue;  // ground / overhead removed
-    // drop points by signed distance to the track boundary. margin>0 keeps an
-    // outer ring (tolerant); margin<0 erodes a near-wall band (drops wall returns
-    // that scatter just inside the track).
-    if (do_track && track_->SignedOutside(p.x(), p.y()) > p_.track_margin)
+    // erosion: drop points within track_dist_min of the nearest non-track
+    // (wall/off-track) cell. Off-track points are always 0 (always dropped);
+    // on-track points need enough clearance from every wall to survive.
+    if (do_track && track_->DistToBlack(p.x(), p.y()) <= p_.track_dist_min)
       continue;
     const int ix = static_cast<int>(std::floor(p.x() * inv_res));
     const int iy = static_cast<int>(std::floor(p.y() * inv_res));

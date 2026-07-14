@@ -1,8 +1,11 @@
 #pragma once
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -57,14 +60,14 @@ public:
     if (slash != std::string::npos) dir = yaml_path.substr(0, slash + 1);
     std::vector<uint8_t> px;
     int w = 0, h = 0;
-    if (!ReadPGM(dir + image, px, w, h)) {
-      // map_server yamls frequently reference a .png/.bmp (e.g. cartographer
-      // output) while a sibling .pgm exists. Our reader is PGM-only (no image
-      // codec dependency), so fall back to the same basename with a .pgm ext.
+    if (!ReadImage(dir + image, px, w, h)) {
+      // Unreadable (unsupported PNG variant, corrupt file, etc.) -- fall back
+      // to a sibling file with the same basename and a .pgm extension, in case
+      // one was generated alongside (e.g. by glim_map_pipeline.py).
       const auto dot = image.find_last_of('.');
       const std::string pgm =
           (dot == std::string::npos ? image : image.substr(0, dot)) + ".pgm";
-      if (pgm == image || !ReadPGM(dir + pgm, px, w, h)) return false;
+      if (pgm == image || !ReadImage(dir + pgm, px, w, h)) return false;
     }
 
     res_ = res;
@@ -89,6 +92,36 @@ public:
     if (c < 0 || c >= W_ || r < 0 || r >= H_)
       return std::numeric_limits<double>::infinity();
     return sdf_[static_cast<size_t>(r) * W_ + c];
+  }
+
+  // x, y in the map frame [m]; unsigned horizontal distance to the nearest
+  // track (white) cell: 0 when (x,y) is itself on/inside the track, >0 when
+  // outside (how far to the nearest drivable cell). +inf off the grid or with
+  // no mask loaded (so a max-distance threshold keeps nothing, not everything --
+  // callers should check Valid() first if they want fail-open behavior).
+  double DistToTrack(double x, double y) const {
+    if (!Valid()) return std::numeric_limits<double>::infinity();
+    const int c = static_cast<int>(std::floor((x - ox_) / res_));
+    const int r = static_cast<int>(std::floor((y - oy_) / res_));
+    if (c < 0 || c >= W_ || r < 0 || r >= H_)
+      return std::numeric_limits<double>::infinity();
+    return dist_to_track_[static_cast<size_t>(r) * W_ + c];
+  }
+
+  // x, y in the map frame [m]; unsigned horizontal distance to the nearest
+  // non-track (black/wall/unmapped) cell: 0 when (x,y) is itself off the
+  // track, >0 when on/inside it (how far to the nearest wall). This is what
+  // erosion needs: require DistToBlack > some minimum to count a point as an
+  // obstacle candidate, so returns close to a wall are dropped regardless of
+  // still being technically inside the track polygon. +inf off the grid or
+  // with no mask loaded.
+  double DistToBlack(double x, double y) const {
+    if (!Valid()) return std::numeric_limits<double>::infinity();
+    const int c = static_cast<int>(std::floor((x - ox_) / res_));
+    const int r = static_cast<int>(std::floor((y - oy_) / res_));
+    if (c < 0 || c >= W_ || r < 0 || r >= H_)
+      return std::numeric_limits<double>::infinity();
+    return dist_to_black_[static_cast<size_t>(r) * W_ + c];
   }
 
   // Bilinearly-interpolated signed distance `val` [m] and its in-plane gradient
@@ -154,6 +187,144 @@ private:
     px.resize(static_cast<size_t>(w) * h);
     f.read(reinterpret_cast<char *>(px.data()), px.size());
     return static_cast<size_t>(f.gcount()) == px.size();
+  }
+
+  // Dispatches by file signature (not extension -- the yaml's `image:` field
+  // isn't trustworthy) to ReadPGM or ReadPNG. Output px is always single-byte
+  // grayscale, row-major, same convention as ReadPGM.
+  static bool ReadImage(const std::string &path, std::vector<uint8_t> &px,
+                        int &w, int &h) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    unsigned char sig[8];
+    f.read(reinterpret_cast<char *>(sig), 8);
+    if (f.gcount() != 8) return false;
+    static const unsigned char kPngSig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    f.close();
+    if (std::memcmp(sig, kPngSig, 8) == 0) return ReadPNG(path, px, w, h);
+    return ReadPGM(path, px, w, h);
+  }
+
+  // Non-interlaced 8-bit PNG reader (grayscale/RGB/palette/gray+alpha/RGBA --
+  // covers what matplotlib's imsave and map_server tooling actually produce).
+  // Uses zlib directly for IDAT inflate; no other image-codec dependency.
+  // Output is single-channel: the R (or gray) channel of each pixel, which is
+  // what grayscale-colormap track/occupancy images actually carry. Returns
+  // false for anything else (16-bit depth, interlaced, corrupt) so the caller
+  // can fall back to a sibling .pgm.
+  static bool ReadPNG(const std::string &path, std::vector<uint8_t> &px, int &w,
+                      int &h) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    unsigned char sig[8];
+    f.read(reinterpret_cast<char *>(sig), 8);
+    if (f.gcount() != 8) return false;
+
+    int bitdepth = 0, colortype = -1, interlace = 0;
+    std::vector<unsigned char> palette;       // RGB triplets
+    std::vector<unsigned char> idat;          // concatenated compressed data
+    bool have_ihdr = false;
+
+    while (f) {
+      unsigned char lenb[4], typeb[4];
+      f.read(reinterpret_cast<char *>(lenb), 4);
+      if (f.gcount() != 4) break;
+      f.read(reinterpret_cast<char *>(typeb), 4);
+      if (f.gcount() != 4) break;
+      const uint32_t len = (static_cast<uint32_t>(lenb[0]) << 24) |
+                            (static_cast<uint32_t>(lenb[1]) << 16) |
+                            (static_cast<uint32_t>(lenb[2]) << 8) | lenb[3];
+      const std::string type(reinterpret_cast<char *>(typeb), 4);
+      std::vector<unsigned char> data(len);
+      if (len > 0) {
+        f.read(reinterpret_cast<char *>(data.data()), len);
+        if (static_cast<uint32_t>(f.gcount()) != len) return false;
+      }
+      unsigned char crc[4];
+      f.read(reinterpret_cast<char *>(crc), 4);  // not verified
+
+      if (type == "IHDR") {
+        if (len != 13) return false;
+        w = (static_cast<int>(data[0]) << 24) | (static_cast<int>(data[1]) << 16) |
+            (static_cast<int>(data[2]) << 8) | data[3];
+        h = (static_cast<int>(data[4]) << 24) | (static_cast<int>(data[5]) << 16) |
+            (static_cast<int>(data[6]) << 8) | data[7];
+        bitdepth = data[8];
+        colortype = data[9];
+        interlace = data[12];
+        have_ihdr = true;
+        if (w <= 0 || h <= 0 || bitdepth != 8 || interlace != 0) return false;
+      } else if (type == "PLTE") {
+        palette = data;
+      } else if (type == "IDAT") {
+        idat.insert(idat.end(), data.begin(), data.end());
+      } else if (type == "IEND") {
+        break;
+      }
+    }
+    if (!have_ihdr || idat.empty()) return false;
+
+    int channels = 0;
+    switch (colortype) {
+      case 0: channels = 1; break;  // gray
+      case 2: channels = 3; break;  // RGB
+      case 3: channels = 1; break;  // palette index
+      case 4: channels = 2; break;  // gray+alpha
+      case 6: channels = 4; break;  // RGBA
+      default: return false;
+    }
+    if (colortype == 3 && palette.size() < 3) return false;
+
+    const size_t row_bytes = static_cast<size_t>(w) * channels;
+    const size_t raw_size = static_cast<size_t>(h) * (row_bytes + 1);  // +1 filter byte/row
+    std::vector<unsigned char> raw(raw_size);
+    uLongf dest_len = static_cast<uLongf>(raw_size);
+    if (uncompress(raw.data(), &dest_len, idat.data(),
+                   static_cast<uLong>(idat.size())) != Z_OK ||
+        dest_len != raw_size)
+      return false;
+
+    // un-filter each scanline in place (PNG filter types 0-4)
+    std::vector<unsigned char> prev(row_bytes, 0), cur(row_bytes);
+    px.resize(static_cast<size_t>(w) * h);
+    for (int y = 0; y < h; ++y) {
+      const unsigned char *row = raw.data() + static_cast<size_t>(y) * (row_bytes + 1);
+      const unsigned char filt = row[0];
+      const unsigned char *in = row + 1;
+      for (size_t x = 0; x < row_bytes; ++x) {
+        const int a = (x >= static_cast<size_t>(channels)) ? cur[x - channels] : 0;
+        const int b = prev[x];
+        const int c = (x >= static_cast<size_t>(channels)) ? prev[x - channels] : 0;
+        int recon = in[x];
+        switch (filt) {
+          case 0: break;                                        // None
+          case 1: recon += a; break;                             // Sub
+          case 2: recon += b; break;                              // Up
+          case 3: recon += (a + b) / 2; break;                    // Average
+          case 4: {                                               // Paeth
+            const int p = a + b - c;
+            const int pa = std::abs(p - a), pb = std::abs(p - b), pc = std::abs(p - c);
+            recon += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+            break;
+          }
+          default: return false;
+        }
+        cur[x] = static_cast<unsigned char>(recon);
+      }
+      // extract the gray/R channel into px
+      for (int x = 0; x < w; ++x) {
+        unsigned char v;
+        if (colortype == 3) {
+          const size_t pi = static_cast<size_t>(cur[x]) * 3;
+          v = (pi + 0 < palette.size()) ? palette[pi] : 0;
+        } else {
+          v = cur[static_cast<size_t>(x) * channels];  // gray or R channel
+        }
+        px[static_cast<size_t>(y) * w + x] = v;
+      }
+      prev.swap(cur);
+    }
+    return true;
   }
 
   // 1D squared-distance transform (Felzenszwalb & Huttenlocher).
@@ -228,11 +399,15 @@ private:
     sdf_.resize(static_cast<size_t>(W_) * H_);
     for (size_t i = 0; i < sdf_.size(); ++i)
       sdf_[i] = d_track[i] - d_black[i];  // <0 inside (= -dist to wall), >0 outside
+    dist_to_track_ = d_track;  // unsigned distance to nearest track cell (DistToTrack)
+    dist_to_black_ = d_black;  // unsigned distance to nearest non-track cell (DistToBlack)
   }
 
   int W_ = 0, H_ = 0;
   double res_ = 0.05, ox_ = 0.0, oy_ = 0.0;
   std::vector<float> sdf_;  // [r*W + c], r=0 at low world-y, signed m to boundary
+  std::vector<float> dist_to_track_;  // [r*W + c], unsigned m to nearest track cell
+  std::vector<float> dist_to_black_;  // [r*W + c], unsigned m to nearest non-track cell
 };
 
 }  // namespace kiss_loc

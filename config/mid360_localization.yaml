@@ -109,12 +109,12 @@
     # (prior map 근접 점 제거 = 옛 stage-1은 이 시나리오에서 중복이라 코드에서 제거됨.)
     # GLIM map_track(점유격자 free영역) 안=장애물(유지), 밖=벽/외곽(제거).
     # 법선방향 = 위 z밴드 crop, 법선수직(in-plane) = 이 트랙 거리 필터.
-    detect_track_filter: true     # track 마스크 기반 점 제거
-    # signed margin: SignedOutside(<0=트랙안, >0=트랙밖) > margin 이면 제거.
-    #   margin>0 = 경계 팽창(관대, 벽 누수↑) | margin<0 = 침식(벽 쪽 버퍼, 벽 빡세게 제거).
-    # 벽 점이 localization 흔들림·벽 두께로 트랙 안 몇 cm 튀어들어와도 침식이 흡수.
-    # -0.1 = 트랙 경계 안쪽 10cm까지 제거. 벽에 바싹 붙은 장애물 놓치면 -0.05로 완화.
-    detect_track_margin: -0.2
+    detect_track_filter: true     # track 마스크 기반 점 제거 (침식)
+    # 기준 = 가장 가까운 비트랙(검은색/벽) 셀까지의 거리(DistToBlack, 항상 ≥0).
+    # 트랙 밖(벽 위)은 항상 0 → 항상 제거. 트랙 안쪽은 벽에서 멀수록 값이 커짐 —
+    # 이 값이 dist_min 이하면 제거(벽 근처 침식), 넘으면 장애물 후보로 유지.
+    # 0.2 = 벽에서 20cm 이내는 다 깎아냄(침식) — 값 낮출수록 관대(벽 가까이도 허용).
+    detect_track_dist_min: 0.2
     # detection mask 2D png/yaml (map_server 스타일; image png여도 형제 pgm 폴백).
     # 비우면 `map`에서 <map>_track.yaml 도출. stage-2 검출 필터용.
     track_map_yaml: ""

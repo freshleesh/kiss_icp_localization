@@ -37,6 +37,7 @@
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker_array.hpp>
 
@@ -77,9 +78,15 @@ public:
     if (publish_2d_scan_)
       scan_2d_pub_ =
           create_publisher<sensor_msgs::msg::PointCloud2>(scan_2d_topic_, 5);
+    if (publish_residual_cloud_)
+      residual_pub_ =
+          create_publisher<sensor_msgs::msg::PointCloud2>(residual_topic_, 5);
     map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         "/kiss_loc/map", rclcpp::QoS(1).transient_local());
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    tf_static_broadcaster_ =
+        std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
+    publishLidarStaticTf();  // static base_link -> lidar_frame (mount extrinsic)
     publishMapCloud();
 
     if (publish_2d_map_) {
@@ -116,8 +123,8 @@ public:
                      tp.c_str());
         throw std::runtime_error("track mask load failed");
       }
-      RCLCPP_INFO(get_logger(), "loaded detection track mask %s (margin %.2f m)",
-                  tp.c_str(), bev_params_.track_margin);
+      RCLCPP_INFO(get_logger(), "loaded detection track mask %s (dist_min %.2f m)",
+                  tp.c_str(), bev_params_.track_dist_min);
     }
 
     if (detect_en_) {
@@ -133,10 +140,10 @@ public:
       RCLCPP_INFO(get_logger(),
                   "BEV detection enabled: res %.2f m, height band [%.2f, %.2f] "
                   "above GLIM ground n=(%.4f,%.4f,%.4f) off=%.4f, "
-                  "track_filter=%d (margin %.2f)",
+                  "track_filter=%d (dist_min %.2f)",
                   bev_params_.res, bev_params_.z_min, bev_params_.z_max,
                   crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_,
-                  bev_params_.track_filter, bev_params_.track_margin);
+                  bev_params_.track_filter, bev_params_.track_dist_min);
     }
 
     const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
@@ -175,6 +182,12 @@ public:
                   "plane n=(%.4f,%.4f,%.4f) off=%.4f, then scan-to-SDF match "
                   "(3-DoF x,y,yaw) against track mask",
                   crop_z_min_, crop_z_max_, crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_);
+    else if (band_2p5d_)
+      RCLCPP_INFO(get_logger(),
+                  "localization=2.5D: crop scan to height <= %.2f m above plane "
+                  "n=(%.4f,%.4f,%.4f) off=%.4f (floor kept), then full voxel ICP "
+                  "against the 3D map",
+                  crop_z_max_, crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_);
     else
       RCLCPP_INFO(get_logger(), "localization=3D: full scan into ICP (no band crop)");
     RCLCPP_INFO(get_logger(),
@@ -197,6 +210,11 @@ private:
     map_pcd_2d_ = declare_parameter<std::string>("map_pcd_2d", "");
     map_voxel_size_ = declare_parameter<double>("map_voxel_size", 0.5);
     map_max_points_ = declare_parameter<int>("map_max_points_per_voxel", 30);
+    // Added to every loaded map point's z. GLIM references the map z=0 to the
+    // mapping/sensor height, so the ground (and thus base_link) sits at negative z
+    // below the 2D /map grid (drawn at z=0). Set to |base_link z| to lift the map
+    // ground to z=0 -> localization output lands on the grid. (x,y,yaw unaffected.)
+    map_z_offset_ = declare_parameter<double>("map_z_offset", 0.0);
     // point-to-plane when the map PCD carries normals (fast_livo save_map does)
     use_normals_ = declare_parameter<bool>("use_normals", true);
     scan_voxel_size_ = declare_parameter<double>("scan_voxel_size", 0.35);
@@ -224,6 +242,9 @@ private:
     input_mode_ = declare_parameter<std::string>("input_mode", "3d");
     input_scan_ = (input_mode_ == "2d" || input_mode_ == "scan");
     if (input_scan_) localization_2d_ = true;
+    // 2.5D: PointCloud input + voxel ICP (localization_2d stays false), with an
+    // upper-only z-band crop on the scan (keep floor .. crop_z_max).
+    band_2p5d_ = (input_mode_ == "2.5d" || input_mode_ == "2p5d");
     // 3D: full-cloud voxel map for ICP — required. 2D: registration is scan-to-SDF
     // against the track mask (see AlignScanToTrackSdf), so the PCD is NOT used for
     // matching; map_pcd_2d is optional and only serves as the /kiss_loc/map viz +
@@ -303,6 +324,17 @@ private:
     print_stats_ = declare_parameter<bool>("print_stats", false);
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+    // LiDAR position in base_link (rear axle). ICP gives map<-lidar; the published
+    // map<-base_link applies this mount offset: translation from here, rotation =
+    // R_level_ (the ground-normal mount tilt, yaw 0). Default matches the 2D laser.
+    {
+      const auto t_lb =
+          declare_parameter<std::vector<double>>("lidar_xyz_in_base", {0.27, 0.0, 0.11});
+      if (t_lb.size() == 3) lidar_in_base_ = Eigen::Vector3d(t_lb[0], t_lb[1], t_lb[2]);
+    }
+    // Frame the LiDAR publishes in; the node broadcasts a static base_link->this TF
+    // (the mount extrinsic) so the raw cloud is placed in the map tree.
+    lidar_frame_ = declare_parameter<std::string>("lidar_frame", "livox_frame");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/kiss_loc/odometry");
     // 2D occupancy grid: published by the node itself (no nav2_map_server).
     // map_2d_yaml empty -> derive <map_pcd dir>/map_2d.yaml.
@@ -316,6 +348,19 @@ private:
     // localization_2d — the band is computed here regardless of the ICP input.
     publish_2d_scan_ = declare_parameter<bool>("publish_2d_scan", true);
     scan_2d_topic_ = declare_parameter<std::string>("scan_2d_topic", "/kiss_loc/scan_2d");
+
+    // Per-point scan-to-map residual, thresholded: points the static prior map
+    // can't explain (opponents, loose obstacles, unmapped clutter). Reuses the
+    // correspondences AlignScanToMap already computes on its last ICP iteration
+    // (see out_residuals in registration.hpp) — no extra map queries. A point
+    // with no map neighbor within that iteration's adaptive search radius counts
+    // as maximally novel (clamped to that radius) rather than being silently
+    // dropped. residual_threshold is re-read from the parameter server every
+    // scan, so it's rqt/`ros2 param set` tunable live with no extra plumbing.
+    publish_residual_cloud_ = declare_parameter<bool>("publish_residual_cloud", false);
+    residual_topic_ =
+        declare_parameter<std::string>("residual_topic", "/kiss_loc/high_residual");
+    declare_parameter<double>("residual_threshold", 0.15);
 
     // ---- BEV object detection (unmapped statics + opponents) ----
     // detect_en_ already declared above (ground-yaml fail-fast needs it).
@@ -333,10 +378,11 @@ private:
     bp.track_gate = declare_parameter<double>("detect_track_gate", 1.0);
     bp.moving_speed = declare_parameter<double>("detect_moving_speed", 0.5);
     bp.max_misses = declare_parameter<int>("detect_max_misses", 5);
-    // stage-2 subtraction: reject detections outside the 2D track mask
-    // (GLIM map_track). Empty track_map_yaml -> <map dir>/map_track.yaml.
+    // stage-2 subtraction (erosion): reject points within detect_track_dist_min
+    // of the nearest non-track (wall/off-track) cell (GLIM map_track). Empty
+    // track_map_yaml -> <map dir>/map_track.yaml.
     bp.track_filter = declare_parameter<bool>("detect_track_filter", false);
-    bp.track_margin = declare_parameter<double>("detect_track_margin", 0.3);
+    bp.track_dist_min = declare_parameter<double>("detect_track_dist_min", 0.2);
     track_map_path_ = declare_parameter<std::string>("track_map_yaml", "");
     // dedicated 2D-localization SDF map (yaml+pgm); empty -> fall back to track map
     loc_map_path_ = declare_parameter<std::string>("loc_2d_map_yaml", "");
@@ -388,7 +434,7 @@ private:
       const bool explicit_path = !ground_yaml_.empty();
       // scan-input 2D needs no band geometry (points are already 2D); only a
       // PointCloud2-fed 2D crop or detection requires the ground plane.
-      const bool need_band = (localization_2d_ && !input_scan_) || detect_en_;
+      const bool need_band = (localization_2d_ && !input_scan_) || detect_en_ || band_2p5d_;
       if (explicit_path || need_band) {
         RCLCPP_FATAL(get_logger(),
                      "ground plane yaml not readable: %s (explicit=%d "
@@ -449,7 +495,7 @@ private:
     for (const auto &p : cloud.points) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
         continue;
-      pts.emplace_back(p.x, p.y, p.z);
+      pts.emplace_back(p.x, p.y, p.z + map_z_offset_);
       normals.emplace_back(p.normal_x, p.normal_y, p.normal_z);
       if (normals.back().allFinite() && normals.back().norm() > 0.5)
         ++n_valid_normals;
@@ -499,8 +545,9 @@ private:
   }
 
   void publishMapCloud() {
-    // Downsample for visualization only
-    auto ds = VoxelDownsample(map_cloud_raw_, 0.2);
+    // Same voxel size as the matching map (map_voxel_size) -- one knob instead
+    // of two, and the viz cloud now matches what ICP actually sees.
+    auto ds = VoxelDownsample(map_cloud_raw_, map_voxel_size_);
     pcl::PointCloud<pcl::PointXYZ> cloud;
     cloud.reserve(ds.size());
     for (const auto &p : ds) cloud.emplace_back(p.x(), p.y(), p.z());
@@ -763,6 +810,11 @@ private:
     if (localization_2d_) {
       const double hgt = crop_n_.x() * x + crop_n_.y() * y + crop_n_.z() * z + crop_h_;
       if (hgt < crop_z_min_ || hgt > crop_z_max_) return false;
+    } else if (band_2p5d_) {
+      // 2.5D: drop everything above crop_z_max (dynamic clutter / ceiling); KEEP
+      // the floor (no z_min) so the ground constrains z/roll/pitch in the ICP.
+      const double hgt = crop_n_.x() * x + crop_n_.y() * y + crop_n_.z() * z + crop_h_;
+      if (hgt > crop_z_max_) return false;
     }
     return true;
   }
@@ -813,6 +865,13 @@ private:
     const auto &q = msg->pose.pose.orientation;
     T.translation() = Eigen::Vector3d(p.x, p.y, p.z);
     T.linear() = Eigen::Quaterniond(q.w, q.x, q.y, q.z).toRotationMatrix();
+    // /initialpose is a base_link pose (RViz), but the node tracks the LiDAR pose
+    // T_. Convert: T_lidar = (map<-base) * (base<-lidar), the inverse of the mount
+    // extrinsic publishOdom applies — so the published base lands where clicked.
+    Eigen::Isometry3d T_base_lidar = Eigen::Isometry3d::Identity();
+    T_base_lidar.linear() = R_level_;
+    T_base_lidar.translation() = lidar_in_base_;
+    T = T * T_base_lidar;
     // RViz 2D Pose Estimate has z = 0; keep current z to stay on the map floor
     if (have_first_fix_) T.translation().z() = T_.translation().z();
     if (localization_2d_) {
@@ -953,6 +1012,12 @@ private:
     const double prep_ms = ms_since(t_start);
     const auto t_icp = std::chrono::steady_clock::now();
     const double th = adaptive_->ComputeThreshold();
+    // Per-point residuals from the ICP's own last-iteration correspondences
+    // (see registration.hpp); only 3D/2.5D AlignScanToMap fills this in.
+    std::vector<float> residuals;
+    const bool want_residuals =
+        publish_residual_cloud_ && !localization_2d_ && residual_pub_ &&
+        residual_pub_->get_subscription_count() > 0;
     // 2D: flatten the band slab onto the track-mask SDF (3-DoF x,y,yaw);
     // 3D: full robust point-to-plane ICP against the voxel map.
     auto result =
@@ -960,7 +1025,8 @@ private:
             ? AlignScanToTrackSdf(ds, loc_mask_, T_pred, th, th / 3.0,
                                   max_iterations_, convergence_eps_)
             : AlignScanToMap(ds, map_, T_pred, th, th / 3.0, max_iterations_,
-                             convergence_eps_, use_normals_);
+                             convergence_eps_, use_normals_,
+                             want_residuals ? &residuals : nullptr);
     // 2D: SDF observes only (x,y,yaw) — pin z, drop roll/pitch so the unobserved
     // axes can't dead-reckon the pose off the ground plane (and so the next
     // prediction's forward velocity stays in-plane instead of leaking into z).
@@ -1032,6 +1098,7 @@ private:
     if (publish_aligned_scan_) publishAligned(ds, scan.t_end);
     if (publish_2d_scan_ && scan_2d_pub_->get_subscription_count() > 0)
       publishBand2D(ds, scan.t_end);
+    if (want_residuals) publishHighResidual(ds, residuals, scan.t_end);
 
     // detection runs only on a confident, locked fix — a mislocalized pose
     // would paint the whole scan as foreground. The divergence-coast path
@@ -1101,9 +1168,36 @@ private:
                       yp_ + gain * dyaw);
   }
 
+  // Static base_link -> lidar_frame TF = the mount extrinsic (rotation R_level_ =
+  // ground-normal tilt, translation lidar_in_base_). Completes the tree
+  // map -> base_link -> lidar_frame so the raw /livox cloud is placeable in map.
+  void publishLidarStaticTf() {
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = now();
+    tf.header.frame_id = base_frame_;
+    tf.child_frame_id = lidar_frame_;
+    tf.transform.translation.x = lidar_in_base_.x();
+    tf.transform.translation.y = lidar_in_base_.y();
+    tf.transform.translation.z = lidar_in_base_.z();
+    const Eigen::Quaterniond q(R_level_);
+    tf.transform.rotation.w = q.w();
+    tf.transform.rotation.x = q.x();
+    tf.transform.rotation.y = q.y();
+    tf.transform.rotation.z = q.z();
+    tf_static_broadcaster_->sendTransform(tf);
+  }
+
   void publishOdom(const Eigen::Isometry3d &T_in, double t) {
     // 2D mode: never publish a floating/off-plane pose (z/roll/pitch unobserved)
-    const Eigen::Isometry3d T = localization_2d_ ? planarize(T_in) : T_in;
+    const Eigen::Isometry3d T_lidar = localization_2d_ ? planarize(T_in) : T_in;
+    // ICP gives map<-lidar; shift to map<-base_link (rear axle, level) via the mount
+    // extrinsic base<-lidar = { R_level_ (ground-normal tilt, yaw 0), lidar_in_base_ }.
+    // map<-base = (map<-lidar) * (base<-lidar)^-1. (In 2D, T_lidar's attitude is
+    // Rz(yaw)*R_level_, so this cancels R_level_ -> base_link is pure-yaw / level.)
+    Eigen::Isometry3d T_base_lidar = Eigen::Isometry3d::Identity();
+    T_base_lidar.linear() = R_level_;
+    T_base_lidar.translation() = lidar_in_base_;
+    const Eigen::Isometry3d T = T_lidar * T_base_lidar.inverse();
     nav_msgs::msg::Odometry odom;
     odom.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
     odom.header.frame_id = map_frame_;
@@ -1156,10 +1250,16 @@ private:
   void publishBand2D(const std::vector<Eigen::Vector3d> &pts, double t) {
     pcl::PointCloud<pcl::PointXYZ> cloud;
     cloud.reserve(pts.size());
+    // Band-crop against the MAP-vertical ground, not the static sensor-frame
+    // mount tilt: the GLIM map is gravity-aligned, so the floor normal is (0,0,1)
+    // regardless of the car's pitch/roll. Anchor the floor height to the 6-DoF
+    // pose — the sensor sits crop_h_ above the ground — so a pitching car can't
+    // tilt the band and sweep the floor in at range.
+    const double ground_z = T_.translation().z() - crop_h_;
     for (const auto &p : pts) {
-      const double hgt = crop_n_.dot(p) + crop_h_;  // height above ground (sensor frame)
-      if (hgt < crop_z_min_ || hgt > crop_z_max_) continue;
       const Eigen::Vector3d pw = T_ * p;
+      const double hgt = pw.z() - ground_z;  // height above the map-vertical ground
+      if (hgt < crop_z_min_ || hgt > crop_z_max_) continue;
       cloud.emplace_back(pw.x(), pw.y(), 0.0);  // flatten onto the map ground plane
     }
     sensor_msgs::msg::PointCloud2 msg;
@@ -1167,6 +1267,33 @@ private:
     msg.header.frame_id = map_frame_;
     msg.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
     scan_2d_pub_->publish(msg);
+  }
+
+  // Points whose registration residual against the prior map exceeds
+  // residual_threshold — the static map can't explain them (opponent car, loose
+  // obstacle, unmapped clutter). `residuals[i]` comes straight from
+  // AlignScanToMap's last ICP iteration (registration.hpp) — no re-query here.
+  // intensity = residual magnitude (m), for viz/tuning.
+  void publishHighResidual(const std::vector<Eigen::Vector3d> &pts,
+                           const std::vector<float> &residuals, double t) {
+    const double thresh = get_parameter("residual_threshold").as_double();
+    pcl::PointCloud<pcl::PointXYZI> cloud;
+    cloud.reserve(pts.size() / 8);
+    for (size_t i = 0; i < pts.size(); ++i) {
+      if (residuals[i] <= thresh) continue;
+      const Eigen::Vector3d pw = T_ * pts[i];
+      pcl::PointXYZI pt;
+      pt.x = pw.x();
+      pt.y = pw.y();
+      pt.z = pw.z();
+      pt.intensity = residuals[i];
+      cloud.push_back(pt);
+    }
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(cloud, msg);
+    msg.header.frame_id = map_frame_;
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
+    residual_pub_->publish(msg);
   }
 
   // --------------------------- detection ---------------------------
@@ -1177,8 +1304,14 @@ private:
     pts_map.reserve(scan_sensor.size());
     for (const auto &p : scan_sensor) pts_map.push_back(T_ * p);
 
-    // GLIM ground plane (sensor frame) rotated into the map frame for this pose:
-    // height(p_map) = n_map.p_map + h_map, identical to the sensor-frame height.
+    // Ground plane in the map frame: the calibrated sensor-frame normal
+    // (crop_n_/crop_h_, from ground_lidar.yaml) rotated into the map frame by
+    // the CURRENT pose, every frame. height(p_sensor) = crop_n_.p_sensor +
+    // crop_h_ must equal height(p_map) = n_map.p_map + h_map for p_map = T_*p_sensor
+    // = R*p_sensor + t, which gives n_map = R*crop_n_ and h_map = crop_h_ - n_map.t
+    // (translation-only substitution, no small-angle assumption). This tracks
+    // real car pitch/roll instead of assuming map-vertical; it rides on
+    // localization's roll/pitch estimate, so it's only as good as that.
     const Eigen::Vector3d n_map = T_.rotation() * crop_n_;
     const double h_map = crop_h_ - n_map.dot(T_.translation());
     // ground z at (x,y): solve n_map.(x,y,z) + h_map = 0 for marker placement
@@ -1287,10 +1420,12 @@ private:
   std::string map_pcd_path_;  // active map (selected from 2d/3d by localization_2d)
   std::string map_pcd_3d_, map_pcd_2d_, ground_yaml_;
   std::string lidar_topic_, imu_topic_, map_frame_, base_frame_;
+  std::string lidar_frame_ = "livox_frame";  // LiDAR cloud frame_id (static TF child)
   // 2D LaserScan input front-end + wheel-odom translation source
   std::string input_mode_, scan_topic_, odom_twist_topic_;
   bool input_scan_ = false, use_odom_twist_ = false;
   double map_voxel_size_, scan_voxel_size_, min_range_, max_range_;
+  double map_z_offset_ = 0.0;  // z added to loaded map points (ground -> grid z=0)
   int map_max_points_, point_filter_num_, max_iterations_, imu_init_samples_;
   double convergence_eps_, initial_threshold_, min_threshold_, min_motion_;
   double reject_trans_, reject_rot_deg_, max_velocity_, max_accel_;
@@ -1304,6 +1439,11 @@ private:
   Eigen::Matrix3d R_il_ = Eigen::Matrix3d::Identity();
   // 2D localization (band-crop scan for ICP) + ground-band plane geometry
   bool localization_2d_ = false;
+  // 2.5D mode: 3D PointCloud input + full voxel ICP (like 3D), but the scan is
+  // cropped to keep only points at/below crop_z_max above the static GLIM ground
+  // — floor INCLUDED, no z_min — so dynamic clutter / ceiling above the band is
+  // dropped while the ground anchors z/roll/pitch. Matches the full 3D map.
+  bool band_2p5d_ = false;
   Eigen::Vector3d crop_n_ = Eigen::Vector3d::UnitZ();
   double crop_h_ = 0.0, crop_z_min_ = 0.05, crop_z_max_ = 0.30;
   bool detect_en_ = false;
@@ -1329,6 +1469,7 @@ private:
   Eigen::Vector3d v_body_ = Eigen::Vector3d::Zero();
   double plane_z_ = 0.0;  // 2D-mode ground-plane height the pose is pinned to
   Eigen::Matrix3d R_level_ = Eigen::Matrix3d::Identity();  // 2D: levels crop_n_ -> map z
+  Eigen::Vector3d lidar_in_base_{0.27, 0.0, 0.11};  // LiDAR pos in base_link (mount offset)
   double corr_gain_ = 1.0;  // 2D scan-to-SDF complementary-filter gain (1=raw fix)
   double last_scan_end_ = -1.0;
   double t_prop_ = -1.0;
@@ -1348,6 +1489,9 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr scan_2d_pub_;
   bool publish_2d_scan_ = true;
   std::string scan_2d_topic_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr residual_pub_;
+  bool publish_residual_cloud_ = false;
+  std::string residual_topic_;  // residual_threshold itself is read live, not cached
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc2_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
@@ -1355,6 +1499,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
       initpose_sub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_static_broadcaster_;
 
   // detection
   std::unique_ptr<BevDetector> detector_;

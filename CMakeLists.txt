@@ -19,6 +19,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io)
 find_package(OpenMP COMPONENTS CXX)
+find_package(ZLIB REQUIRED)  # TrackMask's built-in PNG decoder (IDAT inflate)
 
 # Pure-Eigen core (no ROS) so it can be unit-tested standalone
 add_library(kiss_loc_core
@@ -30,7 +31,7 @@ target_include_directories(kiss_loc_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(kiss_loc_core Eigen3::Eigen)
+target_link_libraries(kiss_loc_core Eigen3::Eigen ZLIB::ZLIB)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(kiss_loc_core OpenMP::OpenMP_CXX)
 endif()

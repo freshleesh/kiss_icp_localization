@@ -30,13 +30,16 @@ struct BevParams {
   // matches crop_z_min/crop_z_max from that yaml.
   double z_min = 0.05;       // keep points this far above ground [m] (ground removal)
   double z_max = 0.30;       // ... and below this (drop overhead)
-  // Track filter: drop points by signed distance to the track mask boundary
-  // (TrackMask, GLIM map_track of the drivable area). A point is dropped when
-  // SignedOutside(x,y) > track_margin. This is the in-plane companion to the
-  // normal-direction z-band crop above and is the only spatial filter: track
-  // inside = obstacle (kept), outside = wall / off-track (removed).
-  bool track_filter = false; // require points to lie on/near the track mask
-  double track_margin = 0.0; // signed: >0 dilate (tolerant), <0 erode (drop near-wall band) [m]
+  // Track filter (erosion): drop points by unsigned distance to the nearest
+  // non-track (black/wall/off-track) cell (TrackMask::DistToBlack). A point is
+  // dropped when DistToBlack(x,y) <= track_dist_min. Points off the track are
+  // always 0 (always dropped); points inside grow with distance from the
+  // nearest wall, so only returns solidly inside the track -- at least
+  // track_dist_min from any wall/off-track cell -- count as obstacle
+  // candidates. This is the in-plane companion to the normal-direction z-band
+  // crop above.
+  bool track_filter = false;    // require points to lie away from the track mask boundary
+  double track_dist_min = 0.2;  // min distance from black/wall [m] to count as a candidate
   // DBSCAN over occupied cells, independent of cell size `res`: eps is the
   // neighborhood radius and a cell needs >= min_samples occupied cells (incl.
   // itself) within eps to be a core. Sparse cells become noise and are dropped,

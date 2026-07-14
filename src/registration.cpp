@@ -18,10 +18,12 @@ namespace {
 inline void AddResidual(const Eigen::Vector3d &pw, const MapPoint &mp,
                         double kernel2, bool use_normals,
                         Eigen::Matrix<double, 6, 6> &JTJ,
-                        Eigen::Matrix<double, 6, 1> &JTr) {
+                        Eigen::Matrix<double, 6, 1> &JTr,
+                        float *out_residual = nullptr) {
   const Eigen::Vector3d r = pw - mp.p;
   if (use_normals && mp.n.squaredNorm() > 0.25) {
     const double rn = mp.n.dot(r);
+    if (out_residual) *out_residual = static_cast<float>(std::abs(rn));
     const double w = kernel2 * kernel2 / ((kernel2 + rn * rn) * (kernel2 + rn * rn));
     Eigen::Matrix<double, 6, 1> Jt;
     Jt.head<3>() = mp.n;
@@ -29,6 +31,7 @@ inline void AddResidual(const Eigen::Vector3d &pw, const MapPoint &mp,
     JTJ.noalias() += Jt * (w * Jt.transpose());
     JTr.noalias() += Jt * (w * rn);
   } else {
+    if (out_residual) *out_residual = static_cast<float>(r.norm());
     const double w = kernel2 * kernel2 /
                      ((kernel2 + r.squaredNorm()) * (kernel2 + r.squaredNorm()));
     Eigen::Matrix<double, 3, 6> J;
@@ -46,9 +49,11 @@ RegistrationResult AlignScanToMap(const std::vector<Eigen::Vector3d> &scan,
                                   const Eigen::Isometry3d &initial_guess,
                                   double max_corr_dist, double kernel_sigma,
                                   int max_iterations, double convergence_eps,
-                                  bool use_normals) {
+                                  bool use_normals,
+                                  std::vector<float> *out_residuals) {
   RegistrationResult result;
   result.pose = initial_guess;
+  if (out_residuals) out_residuals->assign(scan.size(), static_cast<float>(max_corr_dist));
   if (scan.empty() || map.Empty()) return result;
 
   use_normals = use_normals && map.HasNormals();
@@ -74,8 +79,12 @@ RegistrationResult AlignScanToMap(const std::vector<Eigen::Vector3d> &scan,
       for (size_t i = 0; i < scan.size(); ++i) {
         const Eigen::Vector3d pw = T * scan[i];
         MapPoint mp;
+        // disjoint index per point -> no race writing out_residuals across threads
         if (!map.GetClosestNeighbor(pw, max_corr_dist, mp)) continue;
-        AddResidual(pw, mp, kernel2, use_normals, JTJ_p, JTr_p);
+        float res = 0.0f;
+        AddResidual(pw, mp, kernel2, use_normals, JTJ_p, JTr_p,
+                   out_residuals ? &res : nullptr);
+        if (out_residuals) (*out_residuals)[i] = res;
         ++n_p;
       }
 #pragma omp critical
@@ -86,11 +95,13 @@ RegistrationResult AlignScanToMap(const std::vector<Eigen::Vector3d> &scan,
       }
     }
 #else
-    for (const auto &p : scan) {
-      const Eigen::Vector3d pw = T * p;
+    for (size_t i = 0; i < scan.size(); ++i) {
+      const Eigen::Vector3d pw = T * scan[i];
       MapPoint mp;
       if (!map.GetClosestNeighbor(pw, max_corr_dist, mp)) continue;
-      AddResidual(pw, mp, kernel2, use_normals, JTJ, JTr);
+      float res = 0.0f;
+      AddResidual(pw, mp, kernel2, use_normals, JTJ, JTr, out_residuals ? &res : nullptr);
+      if (out_residuals) (*out_residuals)[i] = res;
       ++n;
     }
 #endif

@@ -14,12 +14,14 @@ inline Eigen::Matrix3d Skew(const Eigen::Vector3d &v) {
 }
 
 inline Eigen::Matrix3d So3Exp(const Eigen::Vector3d &w) {
+  // rotation matrix from axis-angle representation
   const double theta = w.norm();
   if (theta < 1e-12) return Eigen::Matrix3d::Identity() + Skew(w);
   return Eigen::AngleAxisd(theta, w / theta).toRotationMatrix();
 }
 
 inline double RotationAngle(const Eigen::Matrix3d &R) {
+  // value of rotation angle from rotation matrix
   return Eigen::AngleAxisd(R).angle();
 }
 
