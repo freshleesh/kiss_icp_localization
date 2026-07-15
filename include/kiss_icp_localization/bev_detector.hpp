@@ -23,13 +23,10 @@ namespace kiss_loc {
 // track is reported as an obstacle — the desired behavior.
 struct BevParams {
   double res = 0.2;          // BEV cell size [m]
-  // Ground plane comes from ground_lidar.yaml (GLIM): the same sensor-frame
-  // plane used to crop the localization input scan. It is passed to Update()
-  // already transformed into the map frame for the just-solved pose, so the
-  // height of a point p is ground_normal.p + ground_offset. The z-band below
-  // matches crop_z_min/crop_z_max from that yaml.
-  double z_min = 0.05;       // keep points this far above ground [m] (ground removal)
-  double z_max = 0.30;       // ... and below this (drop overhead)
+  // Plain map-frame z band: a point counts if p.z is in [z_min, z_max].
+  // No ground-plane normal/rotation involved.
+  double z_min = 0.05;       // keep points with map-frame z at least this [m]
+  double z_max = 0.30;       // ... and at most this
   // Track filter (erosion): drop points by unsigned distance to the nearest
   // non-track (black/wall/off-track) cell (TrackMask::DistToBlack). A point is
   // dropped when DistToBlack(x,y) <= track_dist_min. Points off the track are
@@ -78,11 +75,7 @@ public:
 
   // points_map: deskewed scan already transformed into the map frame.
   // stamp: scan time [s] (monotonic), used for track velocity.
-  // ground_normal / ground_offset: ground plane in the map frame (the GLIM
-  // sensor-frame plane from ground_lidar.yaml rotated by the current pose);
-  // height above ground of a point p is ground_normal.dot(p) + ground_offset.
-  BevResult Update(const std::vector<Eigen::Vector3d> &points_map, double stamp,
-                   const Eigen::Vector3d &ground_normal, double ground_offset);
+  BevResult Update(const std::vector<Eigen::Vector3d> &points_map, double stamp);
 
 private:
   static int64_t CellKey(int ix, int iy) {

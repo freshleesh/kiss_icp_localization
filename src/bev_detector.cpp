@@ -18,20 +18,18 @@ struct Obs {
 }  // namespace
 
 BevResult BevDetector::Update(const std::vector<Eigen::Vector3d> &points_map,
-                              double stamp,
-                              const Eigen::Vector3d &ground_normal,
-                              double ground_offset) {
+                              double stamp) {
   BevResult out;
   const double inv_res = 1.0 / p_.res;
 
   const bool do_track = p_.track_filter && track_ && track_->Valid();
 
-  // ---- ground removal + height crop + track filter, to 2D cells ----
+  // ---- height crop + track filter, to 2D cells ----
   std::unordered_map<int64_t, Obs> cells;
   cells.reserve(points_map.size() / 4 + 16);
   out.obstacle_points.reserve(points_map.size() / 4 + 16);
   for (const auto &p : points_map) {
-    const double r = ground_normal.dot(p) + ground_offset;  // height above ground
+    const double r = p.z();  // plain map-frame z
     if (r < p_.z_min || r > p_.z_max) continue;  // ground / overhead removed
     // erosion: drop points within track_dist_min of the nearest non-track
     // (wall/off-track) cell. Off-track points are always 0 (always dropped);

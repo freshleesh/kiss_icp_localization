@@ -138,11 +138,9 @@ public:
       obstacle_pose_pub_ = create_publisher<geometry_msgs::msg::PoseArray>(
           obstacle_pose_topic_, 5);
       RCLCPP_INFO(get_logger(),
-                  "BEV detection enabled: res %.2f m, height band [%.2f, %.2f] "
-                  "above GLIM ground n=(%.4f,%.4f,%.4f) off=%.4f, "
+                  "BEV detection enabled: res %.2f m, map-frame z band [%.2f, %.2f], "
                   "track_filter=%d (dist_min %.2f)",
                   bev_params_.res, bev_params_.z_min, bev_params_.z_max,
-                  crop_n_.x(), crop_n_.y(), crop_n_.z(), crop_h_,
                   bev_params_.track_filter, bev_params_.track_dist_min);
     }
 
@@ -366,12 +364,10 @@ private:
     // detect_en_ already declared above (ground-yaml fail-fast needs it).
     BevParams bp;
     bp.res = declare_parameter<double>("detect_res", 0.2);
-    // ground removal + height crop reuse the GLIM ground plane and z-band from
-    // ground_lidar.yaml (crop_ground_normal/offset, crop_z_min/z_max) — single
-    // source of truth with the localization input crop. The plane is in the
-    // sensor frame; runDetection() rotates it into the map frame per pose.
-    bp.z_min = crop_z_min_;
-    bp.z_max = crop_z_max_;
+    // plain map-frame z band, independent of ground_lidar.yaml (crop_z_min_/
+    // crop_z_max_ are the localization input crop, a different thing).
+    bp.z_min = declare_parameter<double>("detect_z_min", 0.05);
+    bp.z_max = declare_parameter<double>("detect_z_max", 0.30);
     bp.eps = declare_parameter<double>("detect_eps", 0.2);
     bp.min_samples = declare_parameter<int>("detect_min_samples", 4);
     bp.min_cluster_cells = declare_parameter<int>("detect_min_cluster_cells", 2);
@@ -1304,23 +1300,7 @@ private:
     pts_map.reserve(scan_sensor.size());
     for (const auto &p : scan_sensor) pts_map.push_back(T_ * p);
 
-    // Ground plane in the map frame: the calibrated sensor-frame normal
-    // (crop_n_/crop_h_, from ground_lidar.yaml) rotated into the map frame by
-    // the CURRENT pose, every frame. height(p_sensor) = crop_n_.p_sensor +
-    // crop_h_ must equal height(p_map) = n_map.p_map + h_map for p_map = T_*p_sensor
-    // = R*p_sensor + t, which gives n_map = R*crop_n_ and h_map = crop_h_ - n_map.t
-    // (translation-only substitution, no small-angle assumption). This tracks
-    // real car pitch/roll instead of assuming map-vertical; it rides on
-    // localization's roll/pitch estimate, so it's only as good as that.
-    const Eigen::Vector3d n_map = T_.rotation() * crop_n_;
-    const double h_map = crop_h_ - n_map.dot(T_.translation());
-    // ground z at (x,y): solve n_map.(x,y,z) + h_map = 0 for marker placement
-    const double nz = (std::abs(n_map.z()) > 1e-6) ? n_map.z() : 1e-6;
-    auto ground_z = [&](double x, double y) {
-      return -(n_map.x() * x + n_map.y() * y + h_map) / nz;
-    };
-
-    const BevResult res = detector_->Update(pts_map, t, n_map, h_map);
+    const BevResult res = detector_->Update(pts_map, t);
     const auto stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
 
     // foreground cloud: points after ground removal + track filter, i.e. the
@@ -1351,7 +1331,7 @@ private:
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
     for (const auto &d : res.detections) {
-      const double gz = ground_z(d.center.x(), d.center.y());
+      const double gz = 0.0;  // ground = map-frame z=0 (map_z_offset convention)
 
       geometry_msgs::msg::Pose pose;
       pose.position.x = d.center.x();
