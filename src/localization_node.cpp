@@ -137,11 +137,14 @@ public:
           detection_topic_, 5);
       obstacle_pose_pub_ = create_publisher<geometry_msgs::msg::PoseArray>(
           obstacle_pose_topic_, 5);
+      debug_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(debug_topic_, 5);
       RCLCPP_INFO(get_logger(),
-                  "BEV detection enabled: res %.2f m, map-frame z band [%.2f, %.2f], "
-                  "track_filter=%d (dist_min %.2f)",
-                  bev_params_.res, bev_params_.z_min, bev_params_.z_max,
-                  bev_params_.track_filter, bev_params_.track_dist_min);
+                  "BEV detection v2 enabled: res %.2f m, track_filter=%d "
+                  "(dist_min %.2f), RANSAC ground removal (dist_thresh %.2f m, "
+                  "%d iters, vertical_min %.2f)",
+                  bev_params_.res, bev_params_.track_filter, bev_params_.track_dist_min,
+                  bev_params_.ransac_dist_thresh, bev_params_.ransac_iters,
+                  bev_params_.ransac_vertical_min);
     }
 
     const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
@@ -196,6 +199,11 @@ public:
                 input_scan_ ? scan_topic_.c_str() : lidar_topic_.c_str(),
                 imu_topic_.c_str(), imu_en_,
                 use_odom_twist_ ? odom_twist_topic_.c_str() : "(none, CV)");
+    if (use_initial_pose_topic_) {
+      RCLCPP_INFO(get_logger(),
+                  "waiting for IMU bias + a manual /initialpose (RViz 2D Pose "
+                  "Estimate) before localization starts");
+    }
   }
 
 private:
@@ -364,10 +372,17 @@ private:
     // detect_en_ already declared above (ground-yaml fail-fast needs it).
     BevParams bp;
     bp.res = declare_parameter<double>("detect_res", 0.2);
-    // plain map-frame z band, independent of ground_lidar.yaml (crop_z_min_/
-    // crop_z_max_ are the localization input crop, a different thing).
-    bp.z_min = declare_parameter<double>("detect_z_min", 0.05);
-    bp.z_max = declare_parameter<double>("detect_z_max", 0.30);
+    // RANSAC ground-plane removal, refit every frame on the track-filter
+    // survivors -- see BevParams comments. Independent of ground_lidar.yaml
+    // (crop_z_min_/crop_z_max_ are the localization input crop, a different
+    // thing) and of map_z_offset.
+    bp.ransac_dist_thresh = declare_parameter<double>("detect_ransac_dist_thresh", 0.05);
+    bp.ransac_iters = declare_parameter<int>("detect_ransac_iters", 100);
+    bp.ransac_vertical_min = declare_parameter<double>("detect_ransac_vertical_min", 0.85);
+    bp.ransac_min_points = declare_parameter<int>("detect_ransac_min_points", 8);
+    // Hard cap on map-frame z (independent of RANSAC ground removal). Default
+    // effectively disabled; set to enable (e.g. drop overhangs/ceiling returns).
+    bp.z_max = declare_parameter<double>("detect_z_max", 1e9);
     bp.eps = declare_parameter<double>("detect_eps", 0.2);
     bp.min_samples = declare_parameter<int>("detect_min_samples", 4);
     bp.min_cluster_cells = declare_parameter<int>("detect_min_cluster_cells", 2);
@@ -394,6 +409,10 @@ private:
     // /external_obstacles. Each pose.position = cluster bbox center.
     obstacle_pose_topic_ =
         declare_parameter<std::string>("detect_pose_topic", "/kiss_loc/obstacle_poses");
+    // debug: every scan point tagged with which filter stage dropped it
+    // (intensity-coded, see FilterStage) -- only published while subscribed.
+    debug_topic_ =
+        declare_parameter<std::string>("detect_debug_topic", "/kiss_loc/detect_debug");
   }
 
   // detection mask (= 2D track raster) yaml: explicit track_map_yaml, else
@@ -878,7 +897,10 @@ private:
     T_prop_ = T;
     v_body_.setZero();
     adaptive_->Reset();
-    RCLCPP_WARN(get_logger(), "re-anchored from /initialpose: [%.2f %.2f %.2f]",
+    const bool first_time = !have_manual_initial_pose_;
+    have_manual_initial_pose_ = true;
+    RCLCPP_WARN(get_logger(), "%s from /initialpose: [%.2f %.2f %.2f]",
+                first_time ? "starting localization, anchored" : "re-anchored",
                 T.translation().x(), T.translation().y(), T.translation().z());
     // re-publish both map layers so RViz (and any late subscriber) refreshes
     publishMapCloud();
@@ -905,6 +927,15 @@ private:
       // gyro bias still initializing — scans from this period are useless
       // (no deskew, no prediction) and the platform should be static anyway
       if (pending_.size() > 1) pending_.erase(pending_.begin(), pending_.end() - 1);
+      return;
+    }
+    if (use_initial_pose_topic_ && !have_manual_initial_pose_) {
+      // IMU is stable but no one has clicked "2D Pose Estimate" in RViz yet --
+      // don't start locking against the (possibly wrong) initial_pose param.
+      if (pending_.size() > 1) pending_.erase(pending_.begin(), pending_.end() - 1);
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "IMU stable, waiting for /initialpose (RViz 2D Pose "
+                           "Estimate) before starting localization");
       return;
     }
     while (!pending_.empty()) {
@@ -942,6 +973,9 @@ private:
   }
 
   void processScan(const PendingScan &scan) {
+    // wall-clock queueing delay: time this scan sat in pending_ before this
+    // call started (grows first if the pipeline falls behind real time).
+    const double t_start_wall = nowSec();
     const auto t_start = std::chrono::steady_clock::now();
     auto ms_since = [](const std::chrono::steady_clock::time_point &t0) {
       return std::chrono::duration<double, std::milli>(
@@ -950,6 +984,7 @@ private:
     };
 
     // 1) deskew to scan end using gyro rotation + constant body velocity
+    const auto t_deskew = std::chrono::steady_clock::now();
     std::vector<Eigen::Vector3d> pts;
     const bool do_deskew = imu_en_ && deskew_en_ && bias_ready_ &&
                            !scan.rel_time.empty() && scan.t_end > scan.t_begin;
@@ -984,9 +1019,12 @@ private:
     } else {
       pts = scan.points;
     }
+    const double deskew_ms = ms_since(t_deskew);
 
     // 2) downsample
+    const auto t_ds = std::chrono::steady_clock::now();
     const auto ds = VoxelDownsample(pts, scan_voxel_size_);
+    const double ds_ms = ms_since(t_ds);
     if (ds.size() < 20) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "too few points after downsampling (%zu), skipping",
@@ -995,6 +1033,7 @@ private:
     }
 
     // 3) motion prediction
+    const auto t_predict = std::chrono::steady_clock::now();
     Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
     const double dt = (last_scan_end_ > 0.0) ? scan.t_end - last_scan_end_ : 0.0;
     if (dt > 0.0 && dt < 0.5) {
@@ -1003,9 +1042,10 @@ private:
       delta.translation() = v_body_ * dt;
     }
     const Eigen::Isometry3d T_pred = T_ * delta;
+    const double predict_ms = ms_since(t_predict);
 
     // 4) registration
-    const double prep_ms = ms_since(t_start);
+    const double prep_ms = ms_since(t_start);  // deskew+downsample+predict total
     const auto t_icp = std::chrono::steady_clock::now();
     const double th = adaptive_->ComputeThreshold();
     // Per-point residuals from the ICP's own last-iteration correspondences
@@ -1032,6 +1072,7 @@ private:
     // 5) divergence gate — an isolated fix jumping away from the prediction
     // is treated as an ICP glitch and coasted over; if it persists, the
     // prediction is what's wrong, so re-anchor to the registration result
+    const auto t_gate = std::chrono::steady_clock::now();
     const Eigen::Isometry3d dev = T_pred.inverse() * result.pose;
     const double dev_t = dev.translation().norm();
     const double dev_r = RotationAngle(dev.rotation());
@@ -1089,30 +1130,47 @@ private:
     T_prop_ = T_;
     t_prop_ = scan.t_end;
     have_first_fix_ = true;
+    const double gate_ms = ms_since(t_gate);
 
+    const auto t_publish = std::chrono::steady_clock::now();
     publishOdom(T_, scan.t_end);
     if (publish_aligned_scan_) publishAligned(ds, scan.t_end);
     if (publish_2d_scan_ && scan_2d_pub_->get_subscription_count() > 0)
       publishBand2D(ds, scan.t_end);
     if (want_residuals) publishHighResidual(ds, residuals, scan.t_end);
+    const double publish_ms = ms_since(t_publish);
 
     // detection runs only on a confident, locked fix — a mislocalized pose
     // would paint the whole scan as foreground. The divergence-coast path
     // already returned above; here we additionally require convergence and
     // skip the frame we just re-anchored on.
+    double detect_ms = 0.0;
     if (detect_en_ && detector_ && have_first_fix_ && !reanchored &&
         result.converged) {
+      const auto t_detect = std::chrono::steady_clock::now();
       runDetection(pts, scan.t_end);
+      detect_ms = ms_since(t_detect);
     }
 
     if (print_stats_) {
-      // STAT lines are machine-parseable (key=value) for offline analysis
+      // STAT lines are machine-parseable (key=value) for offline analysis.
+      // queue_ms: wait in pending_ before processing started (backlog symptom).
+      // deskew/ds/predict/gate/publish_ms: processScan sub-stage breakdown
+      // (prep_ms = deskew+ds+predict, kept for backward compat).
+      // total_ms: full processScan compute; lat_ms: queue_ms+total_ms
+      // (wall-clock arrival to STAT print) — a lat_ms >> total_ms gap means
+      // the backlog (queue_ms), not this stage breakdown, is the bottleneck.
+      const double total_ms = ms_since(t_start);
       RCLCPP_INFO(get_logger(),
-                  "STAT t=%.3f raw=%zu ds=%zu prep_ms=%.1f icp_ms=%.1f "
-                  "iters=%d corr=%d conv=%d th=%.3f dev_t=%.3f dev_r=%.2f "
-                  "dt=%.3f v=%.2f q=%zu lat_ms=%.0f",
-                  scan.t_end, scan.points.size(), ds.size(), prep_ms, icp_ms,
-                  result.iterations, result.num_correspondences,
+                  "STAT t=%.3f raw=%zu ds=%zu queue_ms=%.1f deskew_ms=%.1f "
+                  "ds_ms=%.1f predict_ms=%.1f prep_ms=%.1f icp_ms=%.1f "
+                  "gate_ms=%.1f publish_ms=%.1f detect_ms=%.1f total_ms=%.1f "
+                  "iters=%d corr=%d conv=%d th=%.3f dev_t=%.3f "
+                  "dev_r=%.2f dt=%.3f v=%.2f q=%zu lat_ms=%.0f",
+                  scan.t_end, scan.points.size(), ds.size(),
+                  (t_start_wall - scan.arrival_wall) * 1e3, deskew_ms, ds_ms,
+                  predict_ms, prep_ms, icp_ms, gate_ms, publish_ms, detect_ms,
+                  total_ms, result.iterations, result.num_correspondences,
                   result.converged ? 1 : 0, th, dev_t, dev_r * 180.0 / M_PI,
                   dt, v_body_.norm(), pending_.size(),
                   (nowSec() - scan.arrival_wall) * 1e3);
@@ -1300,7 +1358,8 @@ private:
     pts_map.reserve(scan_sensor.size());
     for (const auto &p : scan_sensor) pts_map.push_back(T_ * p);
 
-    const BevResult res = detector_->Update(pts_map, t);
+    const bool want_debug = debug_pub_->get_subscription_count() > 0;
+    const BevResult res = detector_->Update(pts_map, t, want_debug);
     const auto stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
 
     // foreground cloud: points after ground removal + track filter, i.e. the
@@ -1315,6 +1374,28 @@ private:
       msg.header.frame_id = map_frame_;
       msg.header.stamp = stamp;
       obstacle_pub_->publish(msg);
+    }
+
+    // debug cloud: EVERY input point, intensity = which filter stage dropped
+    // it (see FilterStage) -- 0=survived as obstacle, 1=track, 2=z_max,
+    // 3=ground plane. Lets you tell a real off-track filter miss apart from
+    // an over-eager ground-plane fit while tuning.
+    if (debug_pub_->get_subscription_count() > 0) {
+      pcl::PointCloud<pcl::PointXYZI> dc;
+      dc.reserve(res.debug_points.size());
+      for (const auto &dp : res.debug_points) {
+        pcl::PointXYZI pt;
+        pt.x = dp.p.x();
+        pt.y = dp.p.y();
+        pt.z = dp.p.z();
+        pt.intensity = static_cast<float>(static_cast<int>(dp.stage));
+        dc.push_back(pt);
+      }
+      sensor_msgs::msg::PointCloud2 msg;
+      pcl::toROSMsg(dc, msg);
+      msg.header.frame_id = map_frame_;
+      msg.header.stamp = stamp;
+      debug_pub_->publish(msg);
     }
 
     // cluster centers as PoseArray (map frame) — published every cycle
@@ -1349,7 +1430,7 @@ private:
       m.action = visualization_msgs::msg::Marker::ADD;
       m.pose.position.x = d.center.x();
       m.pose.position.y = d.center.y();
-      m.pose.position.z = gz + bev_params_.z_min + 0.5 * std::max(0.1, d.height);
+      m.pose.position.z = gz + d.z_min + 0.5 * std::max(0.1, d.height);
       m.pose.orientation.w = 1.0;
       m.scale.x = std::max(0.1, d.size.x());
       m.scale.y = std::max(0.1, d.size.y());
@@ -1370,7 +1451,7 @@ private:
         arrow.id = d.id;
         arrow.type = visualization_msgs::msg::Marker::ARROW;
         arrow.action = visualization_msgs::msg::Marker::ADD;
-        const double az = gz + bev_params_.z_min + std::max(0.1, d.height) + 0.2;
+        const double az = gz + d.z_min + std::max(0.1, d.height) + 0.2;
         geometry_msgs::msg::Point p0, p1;
         p0.x = d.center.x();
         p0.y = d.center.y();
@@ -1427,7 +1508,8 @@ private:
   Eigen::Vector3d crop_n_ = Eigen::Vector3d::UnitZ();
   double crop_h_ = 0.0, crop_z_min_ = 0.05, crop_z_max_ = 0.30;
   bool detect_en_ = false;
-  std::string odom_topic_, obstacle_topic_, detection_topic_, obstacle_pose_topic_;
+  std::string odom_topic_, obstacle_topic_, detection_topic_, obstacle_pose_topic_,
+      debug_topic_;
   // 2D occupancy grid (self-published, no nav2_map_server)
   bool publish_2d_map_ = true;
   std::string map_2d_topic_, map_2d_yaml_;
@@ -1454,6 +1536,11 @@ private:
   double last_scan_end_ = -1.0;
   double t_prop_ = -1.0;
   bool have_first_fix_ = false;
+  // Startup gate: once IMU bias is ready, still hold off running ICP until a
+  // manual /initialpose arrives from RViz (when use_initial_pose_topic_ is
+  // on) -- the initial_pose param seeds T_ but is no longer trusted to start
+  // locking on its own. Set true by onInitialPose(); checked in processPending().
+  bool have_manual_initial_pose_ = false;
 
   // imu
   std::deque<ImuSample> imu_buf_;
@@ -1486,6 +1573,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr det_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr obstacle_pose_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_pub_;
 };
 

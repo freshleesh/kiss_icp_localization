@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 #include <cstdint>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -9,12 +10,17 @@
 
 namespace kiss_loc {
 
-// Per-frame BEV obstacle detector. Using the localized (map-frame) scan it
-// removes the ground via the known map ground plane, crops to a vehicle-height
-// band, and drops points outside the track mask (drivable area). The survivors
-// are obstacles / the opponent on the track; they are projected to a 2D grid,
-// clustered, and tracked across frames so each gets a velocity / moving flag
-// (moving => opponent).
+// Per-frame BEV obstacle detector (v2). Using the localized (map-frame) scan,
+// it first drops points by the track mask (map filter -- see track_dist_min),
+// then RANSAC-fits a ground plane to the SURVIVORS of that filter each frame
+// and removes its inliers. What's left are obstacles / the opponent on the
+// track; they are projected to a 2D grid, clustered, and tracked across
+// frames so each gets a velocity / moving flag (moving => opponent).
+//
+// Per-frame RANSAC (vs. a fixed z-band or a static calibrated ground plane)
+// adapts to whatever the actual ground looks like in that scan -- no
+// map_z_offset/ground_lidar.yaml dependency -- at the cost of needing enough
+// map-filter survivors for a plane fit to be well-posed every frame.
 //
 // Stateless per frame (no rolling background): nothing to warm up, no
 // leading-edge false positives as the platform drives into new area, and
@@ -23,20 +29,29 @@ namespace kiss_loc {
 // track is reported as an obstacle — the desired behavior.
 struct BevParams {
   double res = 0.2;          // BEV cell size [m]
-  // Plain map-frame z band: a point counts if p.z is in [z_min, z_max].
-  // No ground-plane normal/rotation involved.
-  double z_min = 0.05;       // keep points with map-frame z at least this [m]
-  double z_max = 0.30;       // ... and at most this
-  // Track filter (erosion): drop points by unsigned distance to the nearest
-  // non-track (black/wall/off-track) cell (TrackMask::DistToBlack). A point is
-  // dropped when DistToBlack(x,y) <= track_dist_min. Points off the track are
-  // always 0 (always dropped); points inside grow with distance from the
-  // nearest wall, so only returns solidly inside the track -- at least
-  // track_dist_min from any wall/off-track cell -- count as obstacle
-  // candidates. This is the in-plane companion to the normal-direction z-band
-  // crop above.
+  // Track filter (erosion, applied FIRST): drop points by unsigned distance to
+  // the nearest non-track (black/wall/off-track) cell (TrackMask::DistToBlack).
+  // A point is dropped when DistToBlack(x,y) <= track_dist_min. Points off the
+  // track are always 0 (always dropped); points inside grow with distance from
+  // the nearest wall, so only returns solidly inside the track -- at least
+  // track_dist_min from any wall/off-track cell -- survive to the RANSAC step.
   bool track_filter = false;    // require points to lie away from the track mask boundary
   double track_dist_min = 0.2;  // min distance from black/wall [m] to count as a candidate
+  // RANSAC ground-plane removal, run on the track-filter survivors each frame.
+  // A plane is accepted only if it's close enough to horizontal (|n.z()| >=
+  // ransac_vertical_min, rejecting wall-like fits) and has enough inliers
+  // (>= ransac_min_points); inliers (|n.p + d| <= ransac_dist_thresh) are then
+  // dropped as ground. If no plane is found (too few survivors, or nothing
+  // horizontal fits well), all survivors pass through unfiltered.
+  double ransac_dist_thresh = 0.05;  // inlier distance to the fitted plane [m]
+  int ransac_iters = 100;            // RANSAC iterations
+  double ransac_vertical_min = 0.85; // min |n.z()| to accept a candidate plane
+  int ransac_min_points = 8;         // minimum survivors to even attempt a fit
+  // Hard cap on map-frame z, applied alongside the track filter (before
+  // RANSAC). Independent of ground removal: RANSAC drops the fitted ground
+  // plane, this drops anything too high regardless of plane fit (overhangs,
+  // ceiling, tall off-track clutter). Default effectively disabled.
+  double z_max = 1e9;
   // DBSCAN over occupied cells, independent of cell size `res`: eps is the
   // neighborhood radius and a cell needs >= min_samples occupied cells (incl.
   // itself) within eps to be a core. Sparse cells become noise and are dropped,
@@ -58,12 +73,30 @@ struct Detection {
   bool moving = false;
   int num_points = 0;
   int num_cells = 0;
-  double height = 0.0;  // cluster height above ground [m]
+  double z_min = 0.0;   // cluster's lowest point, map-frame z [m]
+  double height = 0.0;  // cluster's map-frame z span (max - min) [m]
+};
+
+// Which stage dropped a point (or 0 if it survived as an obstacle candidate),
+// for debug visualization -- see BevResult::debug_points.
+enum class FilterStage : int {
+  kObstacle = 0,  // survived track + z_max + ground filters
+  kTrack = 1,     // dropped by the track/wall erosion filter
+  kZMax = 2,      // dropped by the z_max hard cap
+  kGround = 3,    // dropped as a RANSAC ground-plane inlier
+};
+
+struct DebugPoint {
+  Eigen::Vector3d p;
+  FilterStage stage;
 };
 
 struct BevResult {
   std::vector<Detection> detections;
-  std::vector<Eigen::Vector3d> obstacle_points;  // map-frame band-cropped points
+  std::vector<Eigen::Vector3d> obstacle_points;  // map-frame, track+ground filtered
+  // every input point tagged with the filter stage that dropped it (or
+  // kObstacle if it survived) -- intensity-coded for debug viz.
+  std::vector<DebugPoint> debug_points;
 };
 
 class BevDetector {
@@ -75,7 +108,10 @@ public:
 
   // points_map: deskewed scan already transformed into the map frame.
   // stamp: scan time [s] (monotonic), used for track velocity.
-  BevResult Update(const std::vector<Eigen::Vector3d> &points_map, double stamp);
+  // want_debug: fill BevResult::debug_points (every input point tagged with
+  // its filter stage) -- skipped by default since nobody's usually watching.
+  BevResult Update(const std::vector<Eigen::Vector3d> &points_map, double stamp,
+                   bool want_debug = false);
 
 private:
   static int64_t CellKey(int ix, int iy) {
@@ -85,6 +121,7 @@ private:
 
   BevParams p_;
   const TrackMask *track_ = nullptr;
+  std::mt19937 rng_{42};  // fixed seed: reproducible RANSAC across runs
 
   struct Track {
     int id;
