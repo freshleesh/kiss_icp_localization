@@ -372,6 +372,8 @@ private:
     // detect_en_ already declared above (ground-yaml fail-fast needs it).
     BevParams bp;
     bp.res = declare_parameter<double>("detect_res", 0.2);
+    // false -> feed the raw (non-deskewed) scan to detection; see processScan.
+    detect_deskew_ = declare_parameter<bool>("detect_deskew", true);
     // RANSAC ground-plane removal, refit every frame on the track-filter
     // survivors -- see BevParams comments. Independent of ground_lidar.yaml
     // (crop_z_min_/crop_z_max_ are the localization input crop, a different
@@ -1148,7 +1150,14 @@ private:
     if (detect_en_ && detector_ && have_first_fix_ && !reanchored &&
         result.converged) {
       const auto t_detect = std::chrono::steady_clock::now();
-      runDetection(pts, scan.t_end);
+      // detect_deskew:false feeds the RAW scan instead of the deskewed one.
+      // When the deskew correction itself is wrong (stale/absent odom twist,
+      // timestamp-anchor jitter under hard accel/turn), it splits the cloud
+      // into two crisp sheets that DBSCAN picks up as phantom obstacles; the
+      // raw scan's true motion blur smears continuously instead and mostly
+      // dies in the track-erosion filter. Localization keeps its own deskew
+      // either way (deskew_en).
+      runDetection(detect_deskew_ ? pts : scan.points, scan.t_end);
       detect_ms = ms_since(t_detect);
     }
 
@@ -1508,6 +1517,7 @@ private:
   Eigen::Vector3d crop_n_ = Eigen::Vector3d::UnitZ();
   double crop_h_ = 0.0, crop_z_min_ = 0.05, crop_z_max_ = 0.30;
   bool detect_en_ = false;
+  bool detect_deskew_ = true;
   std::string odom_topic_, obstacle_topic_, detection_topic_, obstacle_pose_topic_,
       debug_topic_;
   // 2D occupancy grid (self-published, no nav2_map_server)
