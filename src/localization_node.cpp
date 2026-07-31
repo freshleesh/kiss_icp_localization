@@ -171,6 +171,11 @@ public:
             else if (n == "detect_track_gate") { bev_params_.track_gate = pm.as_double(); det = true; }
             else if (n == "detect_moving_speed") { bev_params_.moving_speed = pm.as_double(); det = true; }
             else if (n == "detect_max_misses") { bev_params_.max_misses = pm.as_int(); det = true; }
+            else if (n == "detect_self_filter") detect_self_filter_ = pm.as_bool();
+            else if (n == "detect_self_x_min") detect_self_x_min_ = pm.as_double();
+            else if (n == "detect_self_x_max") detect_self_x_max_ = pm.as_double();
+            else if (n == "detect_self_y_min") detect_self_y_min_ = pm.as_double();
+            else if (n == "detect_self_y_max") detect_self_y_max_ = pm.as_double();
             else if (n == "detect_deskew") detect_deskew_ = pm.as_bool();
             else if (n == "deskew_accel") deskew_accel_ = pm.as_bool();
             else if (n == "stamp_at_scan_end") stamp_at_scan_end_ = pm.as_bool();
@@ -437,6 +442,12 @@ private:
     // track_map_yaml -> <map dir>/map_track.yaml.
     bp.track_filter = declare_parameter<bool>("detect_track_filter", false);
     bp.track_dist_min = declare_parameter<double>("detect_track_dist_min", 0.2);
+    // ego self-return box (sensor frame, -x = behind the car); see member decl.
+    detect_self_filter_ = declare_parameter<bool>("detect_self_filter", false);
+    detect_self_x_min_ = declare_parameter<double>("detect_self_x_min", -0.5);
+    detect_self_x_max_ = declare_parameter<double>("detect_self_x_max", -0.1);
+    detect_self_y_min_ = declare_parameter<double>("detect_self_y_min", -0.15);
+    detect_self_y_max_ = declare_parameter<double>("detect_self_y_max", 0.15);
     track_map_path_ = declare_parameter<std::string>("track_map_yaml", "");
     // dedicated 2D-localization SDF map (yaml+pgm); empty -> fall back to track map
     loc_map_path_ = declare_parameter<std::string>("loc_2d_map_yaml", "");
@@ -1457,7 +1468,16 @@ private:
   void runDetection(const std::vector<Eigen::Vector3d> &scan_sensor, double t) {
     std::vector<Eigen::Vector3d> pts_map;
     pts_map.reserve(scan_sensor.size());
-    for (const auto &p : scan_sensor) pts_map.push_back(T_ * p);
+    for (const auto &p : scan_sensor) {
+      // Reject the ego's own body return: a fixed box in the SENSOR frame (x
+      // forward, so -x is behind the car). Applied before the map transform so
+      // it stays glued to the car regardless of pose. Live-tunable (detect_self_*).
+      if (detect_self_filter_ && p.x() >= detect_self_x_min_ &&
+          p.x() <= detect_self_x_max_ && p.y() >= detect_self_y_min_ &&
+          p.y() <= detect_self_y_max_)
+        continue;
+      pts_map.push_back(T_ * p);
+    }
 
     const bool want_debug = debug_pub_->get_subscription_count() > 0;
     const BevResult res = detector_->Update(pts_map, t, want_debug);
@@ -1610,6 +1630,14 @@ private:
   double crop_h_ = 0.0, crop_z_min_ = 0.05, crop_z_max_ = 0.30;
   bool detect_en_ = false;
   bool detect_deskew_ = true;
+  // Ego self-return rejection: drop scan points inside a fixed box in the SENSOR
+  // frame (the LiDAR is forward-facing, aligned with base_link; -x is behind the
+  // car). This removes the car's own chassis/antenna the LiDAR sees behind
+  // itself, which would otherwise cluster as a phantom obstacle at the ego pose.
+  // All live-tunable (detect_self_*) so the box can be dragged onto the self-hit.
+  bool detect_self_filter_ = false;
+  double detect_self_x_min_ = -0.5, detect_self_x_max_ = -0.1;
+  double detect_self_y_min_ = -0.15, detect_self_y_max_ = 0.15;
   std::string odom_topic_, obstacle_topic_, detection_topic_, obstacle_pose_topic_,
       debug_topic_;
   // localization-derived twist publisher state (see publishOdom)
