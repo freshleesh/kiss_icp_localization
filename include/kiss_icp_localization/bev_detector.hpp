@@ -29,29 +29,21 @@ namespace kiss_loc {
 // track is reported as an obstacle — the desired behavior.
 struct BevParams {
   double res = 0.2;          // BEV cell size [m]
-  // Track filter (erosion, applied FIRST): drop points by unsigned distance to
-  // the nearest non-track (black/wall/off-track) cell (TrackMask::DistToBlack).
-  // A point is dropped when DistToBlack(x,y) <= track_dist_min. Points off the
-  // track are always 0 (always dropped); points inside grow with distance from
-  // the nearest wall, so only returns solidly inside the track -- at least
-  // track_dist_min from any wall/off-track cell -- survive to the RANSAC step.
+  // Two filters only: (1) a map-frame z band, (2) the track mask.
+  // ---- (2) Track filter: drop points by unsigned distance to the nearest
+  // non-track (black/wall/off-track) cell (TrackMask::DistToBlack). A point is
+  // dropped when DistToBlack(x,y) <= track_dist_min. Off-track points are 0
+  // (always dropped); on-track points grow with distance from the wall, so only
+  // returns at least track_dist_min from any wall/off-track cell survive.
   bool track_filter = false;    // require points to lie away from the track mask boundary
   double track_dist_min = 0.2;  // min distance from black/wall [m] to count as a candidate
-  // RANSAC ground-plane removal, run on the track-filter survivors each frame.
-  // A plane is accepted only if it's close enough to horizontal (|n.z()| >=
-  // ransac_vertical_min, rejecting wall-like fits) and has enough inliers
-  // (>= ransac_min_points); inliers (|n.p + d| <= ransac_dist_thresh) are then
-  // dropped as ground. If no plane is found (too few survivors, or nothing
-  // horizontal fits well), all survivors pass through unfiltered.
-  double ransac_dist_thresh = 0.05;  // inlier distance to the fitted plane [m]
-  int ransac_iters = 100;            // RANSAC iterations
-  double ransac_vertical_min = 0.85; // min |n.z()| to accept a candidate plane
-  int ransac_min_points = 8;         // minimum survivors to even attempt a fit
-  // Hard cap on map-frame z, applied alongside the track filter (before
-  // RANSAC). Independent of ground removal: RANSAC drops the fitted ground
-  // plane, this drops anything too high regardless of plane fit (overhangs,
-  // ceiling, tall off-track clutter). Default effectively disabled.
-  double z_max = 1e9;
+  // ---- (1) Map-frame z band: keep only z_min <= z <= z_max. Below z_min is
+  // ground/floor, above z_max is ceiling/overhang. Replaces the old RANSAC
+  // ground fit with a fixed band (localization gives a reliable map-frame z, so
+  // the ground sits at a known height). Defaults are effectively disabled
+  // (keep everything); set both per map/car.
+  double z_min = -1e9;   // drop points below this map-frame z (ground)
+  double z_max = 1e9;    // drop points above this map-frame z (ceiling/overhang)
   // DBSCAN over occupied cells, independent of cell size `res`: eps is the
   // neighborhood radius and a cell needs >= min_samples occupied cells (incl.
   // itself) within eps to be a core. Sparse cells become noise and are dropped,
@@ -80,10 +72,10 @@ struct Detection {
 // Which stage dropped a point (or 0 if it survived as an obstacle candidate),
 // for debug visualization -- see BevResult::debug_points.
 enum class FilterStage : int {
-  kObstacle = 0,  // survived track + z_max + ground filters
+  kObstacle = 0,  // survived the z band + track filter
   kTrack = 1,     // dropped by the track/wall erosion filter
-  kZMax = 2,      // dropped by the z_max hard cap
-  kGround = 3,    // dropped as a RANSAC ground-plane inlier
+  kZMax = 2,      // dropped for z > z_max (ceiling/overhang)
+  kGround = 3,    // dropped for z < z_min (floor/ground)
 };
 
 struct DebugPoint {
@@ -112,6 +104,9 @@ public:
   // its filter stage) -- skipped by default since nobody's usually watching.
   BevResult Update(const std::vector<Eigen::Vector3d> &points_map, double stamp,
                    bool want_debug = false);
+
+  // Live-update the tuning params (keeps track state); for rqt / ros2 param set.
+  void SetParams(const BevParams &p) { p_ = p; }
 
 private:
   static int64_t CellKey(int ix, int iy) {

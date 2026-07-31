@@ -30,6 +30,7 @@
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -73,6 +74,9 @@ public:
         initial_threshold_, min_threshold_, min_motion_, adaptive_range_);
 
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 50);
+    if (!loc_twist_topic_.empty())
+      loc_twist_pub_ =
+          create_publisher<geometry_msgs::msg::TwistStamped>(loc_twist_topic_, 50);
     aligned_pub_ =
         create_publisher<sensor_msgs::msg::PointCloud2>("/kiss_loc/scan_aligned", 5);
     if (publish_2d_scan_)
@@ -139,13 +143,41 @@ public:
           obstacle_pose_topic_, 5);
       debug_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(debug_topic_, 5);
       RCLCPP_INFO(get_logger(),
-                  "BEV detection v2 enabled: res %.2f m, track_filter=%d "
-                  "(dist_min %.2f), RANSAC ground removal (dist_thresh %.2f m, "
-                  "%d iters, vertical_min %.2f)",
+                  "BEV detection enabled: res %.2f m, track_filter=%d "
+                  "(dist_min %.2f), z-band [%.2f, %.2f] m (map frame)",
                   bev_params_.res, bev_params_.track_filter, bev_params_.track_dist_min,
-                  bev_params_.ransac_dist_thresh, bev_params_.ransac_iters,
-                  bev_params_.ransac_vertical_min);
+                  bev_params_.z_min, bev_params_.z_max);
     }
+
+    // Live tuning: rqt_reconfigure / `ros2 param set` on the detect_* (and
+    // deskew) knobs takes effect on the next scan without a relaunch. The node
+    // reads these into bev_params_ once at startup and copies them into the
+    // detector, so without this callback a runtime set would be ignored.
+    param_cb_ = add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter> &ps) {
+          rcl_interfaces::msg::SetParametersResult r;
+          r.successful = true;
+          bool det = false;
+          for (const auto &pm : ps) {
+            const std::string &n = pm.get_name();
+            if (n == "detect_z_min") { bev_params_.z_min = pm.as_double(); det = true; }
+            else if (n == "detect_z_max") { bev_params_.z_max = pm.as_double(); det = true; }
+            else if (n == "detect_track_dist_min") { bev_params_.track_dist_min = pm.as_double(); det = true; }
+            else if (n == "detect_track_filter") { bev_params_.track_filter = pm.as_bool(); det = true; }
+            else if (n == "detect_res") { bev_params_.res = pm.as_double(); det = true; }
+            else if (n == "detect_eps") { bev_params_.eps = pm.as_double(); det = true; }
+            else if (n == "detect_min_samples") { bev_params_.min_samples = pm.as_int(); det = true; }
+            else if (n == "detect_min_cluster_cells") { bev_params_.min_cluster_cells = pm.as_int(); det = true; }
+            else if (n == "detect_track_gate") { bev_params_.track_gate = pm.as_double(); det = true; }
+            else if (n == "detect_moving_speed") { bev_params_.moving_speed = pm.as_double(); det = true; }
+            else if (n == "detect_max_misses") { bev_params_.max_misses = pm.as_int(); det = true; }
+            else if (n == "detect_deskew") detect_deskew_ = pm.as_bool();
+            else if (n == "deskew_accel") deskew_accel_ = pm.as_bool();
+            else if (n == "stamp_at_scan_end") stamp_at_scan_end_ = pm.as_bool();
+          }
+          if (det && detector_) detector_->SetParams(bev_params_);
+          return r;
+        });
 
     const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(200);
     if (input_scan_) {
@@ -292,6 +324,12 @@ private:
 
     imu_en_ = declare_parameter<bool>("imu_en", true);
     deskew_en_ = declare_parameter<bool>("deskew_en", true);
+    // Time-varying velocity in the deskew translation: instead of a constant
+    // v over the 100 ms frame, ramp v linearly from the previous frame's speed
+    // to the current one (a = dv/dt) and add the 0.5*a*tau^2 term. Fixes the
+    // floor/cloud doubling under hard accel/brake, where the constant-v model
+    // drops the quadratic term (~0.5*a*T^2, several cm at >1 g). Off by default.
+    deskew_accel_ = declare_parameter<bool>("deskew_accel", false);
     imu_rate_odom_ = declare_parameter<bool>("imu_rate_odom", true);
     imu_init_samples_ = declare_parameter<int>("imu_init_samples", 100);
     auto r_il = declare_parameter<std::vector<double>>(
@@ -313,6 +351,14 @@ private:
     // robustness margin, keep it at sensor max range like upstream KISS-ICP
     adaptive_range_ = declare_parameter<double>("adaptive_range", 60.0);
     vel_smoothing_ = declare_parameter<double>("vel_smoothing", 0.3);
+    // Localization-derived body twist (linear v + angular w from consecutive
+    // scan fixes), published on its own topic for downstream consumers (MPC).
+    // Independent of the wheel-odom twist (use_odom_twist / v_body_) — this is
+    // what the *pose estimate* says the car is doing. EMA-smoothed: per-fix
+    // pose jitter of ~cm at 10 Hz otherwise turns into ~0.1 m/s twist noise.
+    loc_twist_topic_ =
+        declare_parameter<std::string>("loc_twist_topic", "/kiss_loc/twist");
+    loc_twist_smoothing_ = declare_parameter<double>("loc_twist_smoothing", 0.5);
     // 2D scan-to-SDF complementary-filter gain: fraction of the SDF fix applied
     // per scan (1=full/raw, lower=smoother, gyro carries fast motion). Cuts the
     // per-scan yaw/xy jitter inherent to a few-point discretized-SDF fit.
@@ -374,16 +420,11 @@ private:
     bp.res = declare_parameter<double>("detect_res", 0.2);
     // false -> feed the raw (non-deskewed) scan to detection; see processScan.
     detect_deskew_ = declare_parameter<bool>("detect_deskew", true);
-    // RANSAC ground-plane removal, refit every frame on the track-filter
-    // survivors -- see BevParams comments. Independent of ground_lidar.yaml
-    // (crop_z_min_/crop_z_max_ are the localization input crop, a different
-    // thing) and of map_z_offset.
-    bp.ransac_dist_thresh = declare_parameter<double>("detect_ransac_dist_thresh", 0.05);
-    bp.ransac_iters = declare_parameter<int>("detect_ransac_iters", 100);
-    bp.ransac_vertical_min = declare_parameter<double>("detect_ransac_vertical_min", 0.85);
-    bp.ransac_min_points = declare_parameter<int>("detect_ransac_min_points", 8);
-    // Hard cap on map-frame z (independent of RANSAC ground removal). Default
-    // effectively disabled; set to enable (e.g. drop overhangs/ceiling returns).
+    // Ground/ceiling removal is a fixed map-frame z band (no RANSAC): keep
+    // detect_z_min <= z <= detect_z_max. Below z_min is floor, above z_max is
+    // ceiling/overhang. Independent of ground_lidar.yaml's localization input
+    // crop (crop_z_min_/crop_z_max_) and of map_z_offset. Defaults disabled.
+    bp.z_min = declare_parameter<double>("detect_z_min", -1e9);
     bp.z_max = declare_parameter<double>("detect_z_max", 1e9);
     bp.eps = declare_parameter<double>("detect_eps", 0.2);
     bp.min_samples = declare_parameter<int>("detect_min_samples", 4);
@@ -1012,15 +1053,33 @@ private:
         return Rs[idx] * So3Exp(w * std::max(0.0, t - ts[idx]));
       };
       const Eigen::Matrix3d R_end = rotAt(scan.t_end);
+      // Body acceleration over this frame: (v_end - v_begin)/dt_frame, where
+      // v_end = current v_body_ (latest odom ~at scan end), v_begin = previous
+      // frame's v_body_ (~at scan begin). Clamped to +/-max_accel_ so an odom
+      // glitch can't inject a huge quadratic term. Zero when disabled or no
+      // prior sample -> reduces to the constant-v deskew.
+      Eigen::Vector3d a_body = Eigen::Vector3d::Zero();
+      const double dt_frame = (last_scan_end_ > 0.0) ? scan.t_end - last_scan_end_ : 0.0;
+      if (deskew_accel_ && have_v_prev_ && dt_frame > 1e-3 && dt_frame < 0.5) {
+        a_body = (v_body_ - v_body_prev_) / dt_frame;
+        for (int k = 0; k < 3; ++k)
+          a_body[k] = std::max(-max_accel_, std::min(max_accel_, a_body[k]));
+      }
       pts.reserve(scan.points.size());
       for (size_t i = 0; i < scan.points.size(); ++i) {
         const double ti = scan.t_begin + scan.rel_time[i];
+        const double tau = ti - scan.t_end;  // <= 0
         const Eigen::Matrix3d R_rel = R_end.transpose() * rotAt(ti);
-        pts.push_back(R_rel * scan.points[i] + v_body_ * (ti - scan.t_end));
+        // constant-v term + acceleration (quadratic) correction
+        Eigen::Vector3d trans = v_body_ * tau + 0.5 * a_body * (tau * tau);
+        pts.push_back(R_rel * scan.points[i] + trans);
       }
     } else {
       pts = scan.points;
     }
+    // remember this frame's body velocity for next frame's accel estimate
+    v_body_prev_ = v_body_;
+    have_v_prev_ = true;
     const double deskew_ms = ms_since(t_deskew);
 
     // 2) downsample
@@ -1278,6 +1337,39 @@ private:
     odom.twist.twist.linear.z = v_body_.z();
     odom_pub_->publish(odom);
 
+    // Localization-derived body twist from consecutive base poses (finite
+    // difference + EMA). Deliberately NOT v_body_: that is wheel-odom when
+    // use_odom_twist is set. Physically impossible steps (re-anchor jumps,
+    // stale dt) reset the differencing instead of spiking the estimate.
+    if (loc_twist_pub_) {
+      const double dt = t - loc_twist_prev_t_;
+      if (loc_twist_prev_t_ > 0.0 && dt > 1e-4 && dt < 0.5) {
+        const Eigen::Matrix3d R_prev = loc_twist_prev_T_.rotation();
+        const Eigen::Vector3d v_new =
+            R_prev.transpose() *
+            (T.translation() - loc_twist_prev_T_.translation()) / dt;
+        const Eigen::AngleAxisd dR(R_prev.transpose() * T.rotation());
+        const Eigen::Vector3d w_new = dR.axis() * dR.angle() / dt;
+        if (v_new.norm() <= max_velocity_) {
+          const double a = loc_twist_smoothing_;
+          loc_twist_v_ = a * loc_twist_v_ + (1.0 - a) * v_new;
+          loc_twist_w_ = a * loc_twist_w_ + (1.0 - a) * w_new;
+          geometry_msgs::msg::TwistStamped tw;
+          tw.header.stamp = odom.header.stamp;
+          tw.header.frame_id = base_frame_;
+          tw.twist.linear.x = loc_twist_v_.x();
+          tw.twist.linear.y = loc_twist_v_.y();
+          tw.twist.linear.z = loc_twist_v_.z();
+          tw.twist.angular.x = loc_twist_w_.x();
+          tw.twist.angular.y = loc_twist_w_.y();
+          tw.twist.angular.z = loc_twist_w_.z();
+          loc_twist_pub_->publish(tw);
+        }
+      }
+      loc_twist_prev_T_ = T;
+      loc_twist_prev_t_ = t;
+    }
+
     if (publish_tf_) {
       geometry_msgs::msg::TransformStamped tf;
       tf.header = odom.header;
@@ -1520,6 +1612,14 @@ private:
   bool detect_deskew_ = true;
   std::string odom_topic_, obstacle_topic_, detection_topic_, obstacle_pose_topic_,
       debug_topic_;
+  // localization-derived twist publisher state (see publishOdom)
+  std::string loc_twist_topic_;
+  double loc_twist_smoothing_ = 0.5;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr loc_twist_pub_;
+  Eigen::Isometry3d loc_twist_prev_T_ = Eigen::Isometry3d::Identity();
+  double loc_twist_prev_t_ = -1.0;
+  Eigen::Vector3d loc_twist_v_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d loc_twist_w_ = Eigen::Vector3d::Zero();
   // 2D occupancy grid (self-published, no nav2_map_server)
   bool publish_2d_map_ = true;
   std::string map_2d_topic_, map_2d_yaml_;
@@ -1539,6 +1639,9 @@ private:
   Eigen::Isometry3d T_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d T_prop_ = Eigen::Isometry3d::Identity();
   Eigen::Vector3d v_body_ = Eigen::Vector3d::Zero();
+  bool deskew_accel_ = false;                              // time-varying-v deskew
+  Eigen::Vector3d v_body_prev_ = Eigen::Vector3d::Zero();  // last frame's v (for accel)
+  bool have_v_prev_ = false;
   double plane_z_ = 0.0;  // 2D-mode ground-plane height the pose is pinned to
   Eigen::Matrix3d R_level_ = Eigen::Matrix3d::Identity();  // 2D: levels crop_n_ -> map z
   Eigen::Vector3d lidar_in_base_{0.27, 0.0, 0.11};  // LiDAR pos in base_link (mount offset)
@@ -1584,6 +1687,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr det_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr obstacle_pose_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_pub_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_pub_;
 };
 
