@@ -178,6 +178,7 @@ public:
             else if (n == "detect_self_y_max") detect_self_y_max_ = pm.as_double();
             else if (n == "detect_deskew") detect_deskew_ = pm.as_bool();
             else if (n == "deskew_accel") deskew_accel_ = pm.as_bool();
+            else if (n == "planar_prediction") planar_prediction_ = pm.as_bool();
             else if (n == "stamp_at_scan_end") stamp_at_scan_end_ = pm.as_bool();
           }
           if (det && detector_) detector_->SetParams(bev_params_);
@@ -336,6 +337,10 @@ private:
     // drops the quadratic term (~0.5*a*T^2, several cm at >1 g). Off by default.
     deskew_accel_ = declare_parameter<bool>("deskew_accel", false);
     imu_rate_odom_ = declare_parameter<bool>("imu_rate_odom", true);
+    // Constrain IMU/odom propagation to the map XY plane (+ yaw): z/roll/pitch are
+    // held at the last LiDAR fix and set ONLY by the 3D ICP. Stops the high-speed
+    // z-sink (pitched forward velocity leaking into world z). Live-tunable.
+    planar_prediction_ = declare_parameter<bool>("planar_prediction", false);
     imu_init_samples_ = declare_parameter<int>("imu_init_samples", 100);
     auto r_il = declare_parameter<std::vector<double>>(
         "extrinsic_R_il", {1, 0, 0, 0, 1, 0, 0, 0, 1});
@@ -919,6 +924,9 @@ private:
       if (t_prop_ > 0.0 && dt > 0.0 && dt < 0.1) {
         T_prop_.linear() = T_prop_.rotation() * So3Exp(w * dt);
         T_prop_.translation() += T_prop_.rotation() * (v_body_ * dt);
+        // planar propagation: freeze z/roll/pitch to the last LiDAR fix (T_) so
+        // the between-scan estimate advances only in the map XY plane + yaw.
+        if (planar_prediction_) T_prop_ = holdZRP(T_prop_, T_);
         publishOdom(T_prop_, t);
       }
       t_prop_ = t;
@@ -1113,7 +1121,10 @@ private:
         delta.linear() = integrateGyro(last_scan_end_, scan.t_end);
       delta.translation() = v_body_ * dt;
     }
-    const Eigen::Isometry3d T_pred = T_ * delta;
+    // planar propagation: the ICP initial guess advances only in map XY + yaw;
+    // z/roll/pitch stay at the last fix so the 3D ICP alone sets them from LiDAR.
+    const Eigen::Isometry3d T_pred =
+        planar_prediction_ ? holdZRP(T_ * delta, T_) : T_ * delta;
     const double predict_ms = ms_since(t_predict);
 
     // 4) registration
@@ -1283,6 +1294,33 @@ private:
 
   Eigen::Isometry3d planarize(const Eigen::Isometry3d &T) const {
     return fromPlanar(T.translation().x(), T.translation().y(), planarYaw(T));
+  }
+
+  // Keep only the map-frame x, y and yaw of `moved`; restore z, roll and pitch
+  // from `base`. Used when planar_prediction_ is on so IMU/odom propagation can
+  // only advance the pose in the map XY plane (+ yaw) — z/roll/pitch then come
+  // exclusively from the LiDAR ICP result (which owns `base` = the last fix).
+  // This stops the high-speed z-sink: a pitched attitude otherwise leaks the
+  // forward body velocity into a downward world-z increment, and free-running
+  // gyro drifts roll/pitch between fixes. Yaw is taken about the map vertical.
+  Eigen::Isometry3d holdZRP(const Eigen::Isometry3d &moved,
+                            const Eigen::Isometry3d &base) const {
+    const double yaw_moved =
+        std::atan2(moved.linear()(1, 0), moved.linear()(0, 0));
+    const double yaw_base =
+        std::atan2(base.linear()(1, 0), base.linear()(0, 0));
+    // base attitude with its yaw removed -> its roll/pitch only
+    const Eigen::Matrix3d RP =
+        Eigen::AngleAxisd(-yaw_base, Eigen::Vector3d::UnitZ()).toRotationMatrix() *
+        base.linear();
+    Eigen::Isometry3d out = Eigen::Isometry3d::Identity();
+    out.linear() =
+        Eigen::AngleAxisd(yaw_moved, Eigen::Vector3d::UnitZ()).toRotationMatrix() *
+        RP;
+    out.translation() = Eigen::Vector3d(moved.translation().x(),
+                                        moved.translation().y(),
+                                        base.translation().z());
+    return out;
   }
 
   // Complementary low-pass for 2D mode: move a fraction `gain` from the smooth
@@ -1668,6 +1706,7 @@ private:
   Eigen::Isometry3d T_prop_ = Eigen::Isometry3d::Identity();
   Eigen::Vector3d v_body_ = Eigen::Vector3d::Zero();
   bool deskew_accel_ = false;                              // time-varying-v deskew
+  bool planar_prediction_ = false;                         // propagate only map xy+yaw
   Eigen::Vector3d v_body_prev_ = Eigen::Vector3d::Zero();  // last frame's v (for accel)
   bool have_v_prev_ = false;
   double plane_z_ = 0.0;  // 2D-mode ground-plane height the pose is pinned to
