@@ -383,11 +383,9 @@ private:
     // per scan (1=full/raw, lower=smoother, gyro carries fast motion). Cuts the
     // per-scan yaw/xy jitter inherent to a few-point discretized-SDF fit.
     corr_gain_ = declare_parameter<double>("loc_2d_corr_gain", 1.0);
-    reject_trans_ = declare_parameter<double>("reject_trans", 2.0);
-    reject_rot_deg_ = declare_parameter<double>("reject_rot_deg", 30.0);
-    reject_recover_count_ = declare_parameter<int>("reject_recover_count", 3);
-    max_velocity_ = declare_parameter<double>("max_velocity", 15.0);
-    max_accel_ = declare_parameter<double>("max_accel", 10.0);
+    // reject_trans/reject_rot_deg/reject_recover_count and max_velocity/max_accel
+    // are hardcoded constants (see members) — robustness bounds that never needed
+    // tuning; not exposed as params.
 
     initial_pose_ = declare_parameter<std::vector<double>>(
         "initial_pose", {0, 0, 0, 0, 0, 0});  // x y z roll pitch yaw
@@ -1595,9 +1593,13 @@ private:
   double sensor_height_ = 0.0;  // sensor mount height; added to map z (ground -> grid z=0)
   int map_max_points_, point_filter_num_, max_iterations_, imu_init_samples_;
   double convergence_eps_, initial_threshold_, min_threshold_, min_motion_;
-  double reject_trans_, reject_rot_deg_, max_velocity_, max_accel_;
   double adaptive_range_, vel_smoothing_;
-  int reject_recover_count_ = 3;
+  // Hardcoded robustness bounds (not params): divergence gate + deskew/twist clamps.
+  static constexpr double reject_trans_ = 2.0;       // fix jump reject [m]
+  static constexpr double reject_rot_deg_ = 30.0;    // fix jump reject [deg]
+  static constexpr int reject_recover_count_ = 3;    // rejects before re-anchor
+  static constexpr double max_velocity_ = 15.0;      // twist-output outlier gate [m/s]
+  static constexpr double max_accel_ = 10.0;         // deskew accel-term clamp [m/s^2]
   int consecutive_rejects_ = 0;
   bool stamp_at_scan_end_, imu_en_, deskew_en_, imu_rate_odom_,
       publish_tf_, publish_aligned_scan_, use_initial_pose_topic_, print_stats_,
