@@ -179,6 +179,21 @@ public:
             else if (n == "detect_deskew") detect_deskew_ = pm.as_bool();
             else if (n == "deskew_accel") deskew_accel_ = pm.as_bool();
             else if (n == "planar_prediction") planar_prediction_ = pm.as_bool();
+            // Ground-band crop (2.5D / detection): live-tunable, config is the
+            // source of truth (use_ground_yaml=false). crop_z_max is the 2.5D knob.
+            else if (n == "crop_z_min") crop_z_min_ = pm.as_double();
+            else if (n == "crop_z_max") crop_z_max_ = pm.as_double();
+            else if (n == "crop_ground_offset") crop_h_ = pm.as_double();
+            else if (n == "crop_ground_normal") {
+              const auto v = pm.as_double_array();
+              if (v.size() == 3) {
+                crop_n_ = Eigen::Vector3d(v[0], v[1], v[2]);
+                if (crop_n_.norm() > 1e-9) crop_n_.normalize();
+                R_level_ =
+                    Eigen::Quaterniond::FromTwoVectors(crop_n_, Eigen::Vector3d::UnitZ())
+                        .toRotationMatrix();
+              }
+            }
             else if (n == "stamp_at_scan_end") stamp_at_scan_end_ = pm.as_bool();
           }
           if (det && detector_) detector_->SetParams(bev_params_);
@@ -308,12 +323,10 @@ private:
     crop_h_ = declare_parameter<double>("crop_ground_offset", 0.0);
     crop_z_min_ = declare_parameter<double>("crop_z_min", 0.05);
     crop_z_max_ = declare_parameter<double>("crop_z_max", 0.30);
-    // GLIM ground plane: config-only auto-link from the active map folder (or an
-    // explicit ground_yaml). Overrides the four crop_* members above if present —
-    // replaces the launch param-file layering. Must run before the detection
-    // z-band (bp.z_min/z_max) is copied from crop_z_min_/max_ below.
+    // Ground-band crop geometry comes ONLY from the crop_* params above (this
+    // config) and is live-tunable — no ground_lidar.yaml. `ground_yaml` is still
+    // declared (harmless) so the launch-injected param doesn't error; it's unused.
     ground_yaml_ = declare_parameter<std::string>("ground_yaml", "");
-    loadGroundYaml();
 
     lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/livox/lidar");
     imu_topic_ = declare_parameter<std::string>("imu_topic", "/livox/imu");
@@ -484,69 +497,6 @@ private:
     const std::string dir =
         (slash == std::string::npos) ? "" : map_pcd_path_.substr(0, slash + 1);
     return dir + "map_track.yaml";
-  }
-
-  // GLIM ground plane auto-load (config-only; no launch param-file layering).
-  // Reads ground_yaml_ (or <active map dir>/ground_lidar.yaml) and overrides the
-  // crop_* geometry. It's a ROS param file but we only need four keys, so scan
-  // lines rather than pull in a yaml parser. crop_ground_mode (legacy) ignored.
-  void loadGroundYaml() {
-    std::string path = ground_yaml_;
-    if (path.empty()) {
-      if (map_pcd_path_.empty()) return;
-      const auto slash = map_pcd_path_.find_last_of('/');
-      const std::string dir =
-          (slash == std::string::npos) ? "" : map_pcd_path_.substr(0, slash + 1);
-      path = dir + "ground_lidar.yaml";
-    }
-    std::ifstream f(path);
-    if (!f) {
-      // The band geometry is wrong if the ground plane is missing (config default
-      // is the trivial identity plane). Fail fast when the path was set explicitly,
-      // or when 2D localization / detection actually needs the band. Only a plain
-      // 3D run with no detection may proceed on the config crop_* defaults.
-      const bool explicit_path = !ground_yaml_.empty();
-      // scan-input 2D needs no band geometry (points are already 2D); only a
-      // PointCloud2-fed 2D crop or detection requires the ground plane.
-      const bool need_band = (localization_2d_ && !input_scan_) || detect_en_ || band_2p5d_;
-      if (explicit_path || need_band) {
-        RCLCPP_FATAL(get_logger(),
-                     "ground plane yaml not readable: %s (explicit=%d "
-                     "localization_2d=%d detect_en=%d) — the z-band crop needs it",
-                     path.c_str(), explicit_path, localization_2d_, detect_en_);
-        throw std::runtime_error("ground_lidar.yaml not loaded");
-      }
-      RCLCPP_INFO(get_logger(),
-                  "no ground_lidar.yaml at %s -> 3D run, config crop params",
-                  path.c_str());
-      return;
-    }
-    std::string line;
-    while (std::getline(f, line)) {
-      const auto hash = line.find('#');
-      if (hash != std::string::npos) line = line.substr(0, hash);
-      const auto colon = line.find(':');
-      if (colon == std::string::npos) continue;
-      std::string key = line.substr(0, colon), val = line.substr(colon + 1);
-      key.erase(std::remove_if(key.begin(), key.end(), ::isspace), key.end());
-      if (key == "crop_ground_normal") {
-        for (char &c : val)
-          if (c == '[' || c == ']' || c == ',') c = ' ';
-        std::istringstream iss(val);
-        double a, b, c;
-        if (iss >> a >> b >> c) {
-          crop_n_ = Eigen::Vector3d(a, b, c);
-          if (crop_n_.norm() > 1e-9) crop_n_.normalize();
-        }
-      } else if (key == "crop_ground_offset") {
-        crop_h_ = std::atof(val.c_str());
-      } else if (key == "crop_z_min") {
-        crop_z_min_ = std::atof(val.c_str());
-      } else if (key == "crop_z_max") {
-        crop_z_max_ = std::atof(val.c_str());
-      }
-    }
-    RCLCPP_INFO(get_logger(), "ground crop auto-linked from %s", path.c_str());
   }
 
   void loadMap() {
