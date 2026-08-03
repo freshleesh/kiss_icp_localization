@@ -177,7 +177,6 @@ public:
             else if (n == "detect_self_y_min") detect_self_y_min_ = pm.as_double();
             else if (n == "detect_self_y_max") detect_self_y_max_ = pm.as_double();
             else if (n == "detect_deskew") detect_deskew_ = pm.as_bool();
-            else if (n == "deskew_accel") deskew_accel_ = pm.as_bool();
             else if (n == "planar_prediction") planar_prediction_ = pm.as_bool();
             // Ground-band crop (2.5D / detection): live-tunable, config is the
             // source of truth (use_ground_yaml=false). crop_z_max is the 2.5D knob.
@@ -273,7 +272,7 @@ private:
     // mapping/sensor height, so the ground (and thus base_link) sits at negative z
     // below the 2D /map grid (drawn at z=0). Set to |base_link z| to lift the map
     // ground to z=0 -> localization output lands on the grid. (x,y,yaw unaffected.)
-    map_z_offset_ = declare_parameter<double>("map_z_offset", 0.0);
+    sensor_height_ = declare_parameter<double>("sensor_height", 0.0);
     // point-to-plane when the map PCD carries normals (fast_livo save_map does)
     use_normals_ = declare_parameter<bool>("use_normals", true);
     scan_voxel_size_ = declare_parameter<double>("scan_voxel_size", 0.35);
@@ -343,12 +342,10 @@ private:
 
     imu_en_ = declare_parameter<bool>("imu_en", true);
     deskew_en_ = declare_parameter<bool>("deskew_en", true);
-    // Time-varying velocity in the deskew translation: instead of a constant
-    // v over the 100 ms frame, ramp v linearly from the previous frame's speed
-    // to the current one (a = dv/dt) and add the 0.5*a*tau^2 term. Fixes the
-    // floor/cloud doubling under hard accel/brake, where the constant-v model
-    // drops the quadratic term (~0.5*a*T^2, several cm at >1 g). Off by default.
-    deskew_accel_ = declare_parameter<bool>("deskew_accel", false);
+    // The deskew translation ramps v linearly over the 100 ms frame (a = dv/dt)
+    // and adds the 0.5*a*tau^2 term — fixes floor/cloud doubling under hard
+    // accel/brake. Always applied (a no-op at constant v, clamped to max_accel);
+    // no separate toggle.
     imu_rate_odom_ = declare_parameter<bool>("imu_rate_odom", true);
     // Constrain IMU/odom propagation to the map XY plane (+ yaw): z/roll/pitch are
     // held at the last LiDAR fix and set ONLY by the 3D ICP. Stops the high-speed
@@ -445,8 +442,8 @@ private:
     detect_deskew_ = declare_parameter<bool>("detect_deskew", true);
     // Ground/ceiling removal is a fixed map-frame z band (no RANSAC): keep
     // detect_z_min <= z <= detect_z_max. Below z_min is floor, above z_max is
-    // ceiling/overhang. Independent of ground_lidar.yaml's localization input
-    // crop (crop_z_min_/crop_z_max_) and of map_z_offset. Defaults disabled.
+    // ceiling/overhang. Independent of the localization input crop
+    // (crop_z_min_/crop_z_max_) and of sensor_height. Defaults disabled.
     bp.z_min = declare_parameter<double>("detect_z_min", -1e9);
     bp.z_max = declare_parameter<double>("detect_z_max", 1e9);
     bp.eps = declare_parameter<double>("detect_eps", 0.2);
@@ -519,7 +516,7 @@ private:
     for (const auto &p : cloud.points) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
         continue;
-      pts.emplace_back(p.x, p.y, p.z + map_z_offset_);
+      pts.emplace_back(p.x, p.y, p.z + sensor_height_);
       normals.emplace_back(p.normal_x, p.normal_y, p.normal_z);
       if (normals.back().allFinite() && normals.back().norm() > 0.5)
         ++n_valid_normals;
@@ -1025,11 +1022,11 @@ private:
       // Body acceleration over this frame: (v_end - v_begin)/dt_frame, where
       // v_end = current v_body_ (latest odom ~at scan end), v_begin = previous
       // frame's v_body_ (~at scan begin). Clamped to +/-max_accel_ so an odom
-      // glitch can't inject a huge quadratic term. Zero when disabled or no
-      // prior sample -> reduces to the constant-v deskew.
+      // glitch can't inject a huge quadratic term. Zero with no prior sample ->
+      // reduces to the constant-v deskew (always applied; no toggle).
       Eigen::Vector3d a_body = Eigen::Vector3d::Zero();
       const double dt_frame = (last_scan_end_ > 0.0) ? scan.t_end - last_scan_end_ : 0.0;
-      if (deskew_accel_ && have_v_prev_ && dt_frame > 1e-3 && dt_frame < 0.5) {
+      if (have_v_prev_ && dt_frame > 1e-3 && dt_frame < 0.5) {
         a_body = (v_body_ - v_body_prev_) / dt_frame;
         for (int k = 0; k < 3; ++k)
           a_body[k] = std::max(-max_accel_, std::min(max_accel_, a_body[k]));
@@ -1521,7 +1518,7 @@ private:
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
     for (const auto &d : res.detections) {
-      const double gz = 0.0;  // ground = map-frame z=0 (map_z_offset convention)
+      const double gz = 0.0;  // ground = map-frame z=0 (sensor_height convention)
 
       geometry_msgs::msg::Pose pose;
       pose.position.x = d.center.x();
@@ -1595,7 +1592,7 @@ private:
   std::string input_mode_, scan_topic_, odom_twist_topic_;
   bool input_scan_ = false, use_odom_twist_ = false;
   double map_voxel_size_, scan_voxel_size_, min_range_, max_range_;
-  double map_z_offset_ = 0.0;  // z added to loaded map points (ground -> grid z=0)
+  double sensor_height_ = 0.0;  // sensor mount height; added to map z (ground -> grid z=0)
   int map_max_points_, point_filter_num_, max_iterations_, imu_init_samples_;
   double convergence_eps_, initial_threshold_, min_threshold_, min_motion_;
   double reject_trans_, reject_rot_deg_, max_velocity_, max_accel_;
@@ -1655,7 +1652,6 @@ private:
   Eigen::Isometry3d T_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d T_prop_ = Eigen::Isometry3d::Identity();
   Eigen::Vector3d v_body_ = Eigen::Vector3d::Zero();
-  bool deskew_accel_ = false;                              // time-varying-v deskew
   bool planar_prediction_ = false;                         // propagate only map xy+yaw
   Eigen::Vector3d v_body_prev_ = Eigen::Vector3d::Zero();  // last frame's v (for accel)
   bool have_v_prev_ = false;
