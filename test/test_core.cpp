@@ -99,32 +99,6 @@ std::string WriteRectTrackMask() {
   return yaml;
 }
 
-// Wall points sampled along the track-rectangle perimeter, in the map frame.
-std::vector<Eigen::Vector3d> SampleWalls(int n, unsigned seed) {
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<double> ux(0, kTX), uy(0, kTY), u01(0, 1);
-  std::vector<Eigen::Vector3d> pts;
-  pts.reserve(n);
-  for (int i = 0; i < n; ++i) {
-    const double s = u01(rng);
-    if (s < 0.5)  // y-walls (bottom/top)
-      pts.emplace_back(ux(rng), u01(rng) < 0.5 ? 0.0 : kTY, 0.0);
-    else  // x-walls (left/right)
-      pts.emplace_back(u01(rng) < 0.5 ? 0.0 : kTX, uy(rng), 0.0);
-  }
-  return pts;
-}
-
-std::vector<Eigen::Vector3d> MakeWallScan(const Eigen::Isometry3d &T_gt, int n,
-                                          unsigned seed, double noise_sigma) {
-  std::mt19937 rng(seed + 1000);
-  std::normal_distribution<double> noise(0.0, noise_sigma);
-  std::vector<Eigen::Vector3d> scan;
-  for (const auto &p : SampleWalls(n, seed))
-    scan.push_back(T_gt.inverse() * p +
-                   Eigen::Vector3d(noise(rng), noise(rng), 0.0));
-  return kiss_loc::VoxelDownsample(scan, 0.1);
-}
 
 }  // namespace
 
@@ -140,27 +114,6 @@ TEST(TrackSdf, SignAndGradient) {
   ASSERT_TRUE(m.ValueGrad(0.2, 3.0, v, gx, gy));
   EXPECT_LT(gx, -0.5);
   EXPECT_NEAR(gy, 0.0, 0.2);
-}
-
-TEST(TrackSdf, ConvergesFromLargeInitialError) {
-  kiss_loc::TrackMask m;
-  ASSERT_TRUE(m.Load(WriteRectTrackMask()));
-
-  const Eigen::Isometry3d T_gt = MakePose(5.0, 3.0, 0.0, 8.0 * M_PI / 180.0);
-  const auto scan = MakeWallScan(T_gt, 6000, 7, 0.005);
-
-  // perturbed guess (0.3 m / 5 deg off), coarse-then-tight like the node
-  const Eigen::Isometry3d guess =
-      T_gt * MakePose(0.3, -0.2, 0.0, 5.0 * M_PI / 180.0);
-  const auto coarse =
-      kiss_loc::AlignScanToTrackSdf(scan, m, guess, 1.0, 1.0 / 3.0, 100, 1e-6);
-  EXPECT_GT(coarse.num_correspondences, 100);
-  const auto result =
-      kiss_loc::AlignScanToTrackSdf(scan, m, coarse.pose, 0.3, 0.1, 100, 1e-6);
-
-  const Eigen::Isometry3d err = T_gt.inverse() * result.pose;
-  EXPECT_LT(err.translation().norm(), 0.05);  // ~res-limited
-  EXPECT_LT(kiss_loc::RotationAngle(err.rotation()), 1.0 * M_PI / 180.0);
 }
 
 TEST(VoxelHashMap, ClosestNeighbor) {
