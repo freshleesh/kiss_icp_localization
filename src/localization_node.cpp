@@ -133,6 +133,7 @@ public:
           rcl_interfaces::msg::SetParametersResult r;
           r.successful = true;
           bool det = false;
+          bool rebuild_adaptive = false;
           for (const auto &pm : ps) {
             const std::string &n = pm.get_name();
             if (n == "detect_z_min") { bev_params_.z_min = pm.as_double(); det = true; }
@@ -169,8 +170,21 @@ public:
               }
             }
             else if (n == "stamp_at_scan_end") stamp_at_scan_end_ = pm.as_bool();
+            // ICP aggressiveness: raise these to correct larger standing offsets
+            // (esp. 2.5D along-track that the robust ICP leaves uncorrected).
+            // min_threshold = the correspondence-radius + kernel floor kept even
+            // when converged (0.1 -> ~0.3 lets a farther match still pull the pose).
+            // icp_kernel_scale widens the Geman-McClure kernel (kernel_sigma =
+            // th / scale; lower = weights far residuals more = more aggressive).
+            else if (n == "min_threshold") { min_threshold_ = pm.as_double(); rebuild_adaptive = true; }
+            else if (n == "initial_threshold") { initial_threshold_ = pm.as_double(); rebuild_adaptive = true; }
+            else if (n == "adaptive_range") { adaptive_range_ = pm.as_double(); rebuild_adaptive = true; }
+            else if (n == "icp_kernel_scale") icp_kernel_scale_ = pm.as_double();
           }
           if (det && detector_) detector_->SetParams(bev_params_);
+          if (rebuild_adaptive)
+            adaptive_ = std::make_unique<AdaptiveThreshold>(
+                initial_threshold_, min_threshold_, min_motion_, adaptive_range_);
           return r;
         });
 
@@ -294,6 +308,9 @@ private:
     convergence_eps_ = declare_parameter<double>("convergence_eps", 2e-3);
     initial_threshold_ = declare_parameter<double>("initial_threshold", 1.0);
     min_threshold_ = declare_parameter<double>("min_threshold", 0.1);
+    // Geman-McClure kernel width = th / icp_kernel_scale. Lower -> wider kernel ->
+    // far residuals (standing offsets) weigh more -> ICP pulls harder. Live-tunable.
+    icp_kernel_scale_ = declare_parameter<double>("icp_kernel_scale", 3.0);
     min_motion_ = declare_parameter<double>("min_motion", 0.05);
     // characteristic range for the rotation term of the adaptive threshold.
     // Tightening this (e.g. to the true indoor scene scale ~15 m) measurably
@@ -828,7 +845,7 @@ private:
     const bool want_residuals = publish_residual_cloud_ && residual_pub_ &&
                                 residual_pub_->get_subscription_count() > 0;
     // full robust point-to-plane ICP against the voxel map (3D / 2.5D).
-    auto result = AlignScanToMap(ds, map_, T_pred, th, th / 3.0, max_iterations_,
+    auto result = AlignScanToMap(ds, map_, T_pred, th, th / icp_kernel_scale_, max_iterations_,
                                  convergence_eps_, use_normals_,
                                  want_residuals ? &residuals : nullptr);
     const double icp_ms = ms_since(t_icp);
@@ -1275,6 +1292,7 @@ private:
   int map_max_points_, point_filter_num_, max_iterations_, imu_init_samples_;
   double convergence_eps_, initial_threshold_, min_threshold_, min_motion_;
   double adaptive_range_, vel_smoothing_;
+  double icp_kernel_scale_ = 3.0;  // Geman-McClure kernel width = th / this
   // Hardcoded robustness bounds (not params): divergence gate + deskew/twist clamps.
   static constexpr double reject_trans_ = 2.0;       // fix jump reject [m]
   static constexpr double reject_rot_deg_ = 30.0;    // fix jump reject [deg]
