@@ -732,7 +732,20 @@ private:
           .count();
     };
 
-    // 1) deskew to scan end using gyro rotation + constant body velocity
+    // Body acceleration this frame (v_end - v_begin)/dt_frame, clamped. Shared by
+    // the deskew quadratic term AND the motion prediction, so the forward estimate
+    // uses average velocity (v_end*dt - 0.5*a*dt^2), not v_end*dt -- otherwise an
+    // accelerating/braking car is predicted 0.5*a*dt^2 ahead/behind, which a
+    // weak-longitudinal 2.5D scan can't correct (leads on accel, lags on brake).
+    const double dt_frame = (last_scan_end_ > 0.0) ? scan.t_end - last_scan_end_ : 0.0;
+    Eigen::Vector3d a_body = Eigen::Vector3d::Zero();
+    if (have_v_prev_ && dt_frame > 1e-3 && dt_frame < 0.5) {
+      a_body = (v_body_ - v_body_prev_) / dt_frame;
+      for (int k = 0; k < 3; ++k)
+        a_body[k] = std::max(-max_accel_, std::min(max_accel_, a_body[k]));
+    }
+
+    // 1) deskew to scan end using gyro rotation + body velocity (+ accel term)
     const auto t_deskew = std::chrono::steady_clock::now();
     std::vector<Eigen::Vector3d> pts;
     const bool do_deskew = imu_en_ && deskew_en_ && bias_ready_ &&
@@ -759,18 +772,6 @@ private:
         return Rs[idx] * So3Exp(w * std::max(0.0, t - ts[idx]));
       };
       const Eigen::Matrix3d R_end = rotAt(scan.t_end);
-      // Body acceleration over this frame: (v_end - v_begin)/dt_frame, where
-      // v_end = current v_body_ (latest odom ~at scan end), v_begin = previous
-      // frame's v_body_ (~at scan begin). Clamped to +/-max_accel_ so an odom
-      // glitch can't inject a huge quadratic term. Zero with no prior sample ->
-      // reduces to the constant-v deskew (always applied; no toggle).
-      Eigen::Vector3d a_body = Eigen::Vector3d::Zero();
-      const double dt_frame = (last_scan_end_ > 0.0) ? scan.t_end - last_scan_end_ : 0.0;
-      if (have_v_prev_ && dt_frame > 1e-3 && dt_frame < 0.5) {
-        a_body = (v_body_ - v_body_prev_) / dt_frame;
-        for (int k = 0; k < 3; ++k)
-          a_body[k] = std::max(-max_accel_, std::min(max_accel_, a_body[k]));
-      }
       pts.reserve(scan.points.size());
       for (size_t i = 0; i < scan.points.size(); ++i) {
         const double ti = scan.t_begin + scan.rel_time[i];
@@ -799,14 +800,17 @@ private:
       return;
     }
 
-    // 3) motion prediction
+    // 3) motion prediction. Forward displacement = average velocity over the
+    // frame (v_end*dt - 0.5*a*dt^2), not v_end*dt, so an accelerating/braking car
+    // isn't guessed 0.5*a*dt^2 ahead/behind (the along-track error a 2.5D wall
+    // band leaves uncorrected).
     const auto t_predict = std::chrono::steady_clock::now();
     Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
-    const double dt = (last_scan_end_ > 0.0) ? scan.t_end - last_scan_end_ : 0.0;
+    const double dt = dt_frame;
     if (dt > 0.0 && dt < 0.5) {
       if (imu_en_ && bias_ready_)
         delta.linear() = integrateGyro(last_scan_end_, scan.t_end);
-      delta.translation() = v_body_ * dt;
+      delta.translation() = v_body_ * dt - 0.5 * a_body * (dt * dt);
     }
     // planar propagation: the ICP initial guess advances only in map XY + yaw;
     // z/roll/pitch stay at the last fix so the 3D ICP alone sets them from LiDAR.
